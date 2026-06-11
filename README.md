@@ -39,35 +39,42 @@ python leader_pub.py
 ```
 
 ### On jetson orin nano
+
+#### Terminal 1
+
 ```bash
-# Terminal 1
 python follower_sub.py
 ```
 
+#### Terminal 2
+
 ```bash
-# Terminal 2
 python camera_sub.py
 ```
 
 ## For SLAM
 
+#### Terminal 1
+
 ```bash
-# Terminal 1
 python jetson_combined.py --foxglove
 ```
 
+#### Terminal 2
+
 ```bash
-# Terminal 2
 python ros2_scan_bridge.py
 ```
 
+#### Terminal 3
+
 ```bash
-# Terminal 3
 ros2 launch slam_launch.py
 ```
 
+#### Terminal 4
+
 ```bash
-# Terminal 4
 source /opt/ros/jazzy/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8766
 ```
 
