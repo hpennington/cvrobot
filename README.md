@@ -1,6 +1,6 @@
 # CVRobot
 
-## Recording data / arm control / driving / camers
+## Recording data / arm control / driving / cameras
 
 ### Terminal 1
 python leader_pub.py
