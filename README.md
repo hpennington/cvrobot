@@ -3,6 +3,13 @@ This is a tracked robot chassis with a so 101 robotic arm attached to the top
 
 ## Instructions
 
+### Dependencies
+
+librealsense
+ros2
+pygame
+zmq
+
 ## Recording data / arm control / driving / cameras
 
 ### On mac
