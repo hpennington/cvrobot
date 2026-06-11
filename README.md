@@ -9,9 +9,16 @@ The arduino is being used for the PWM drivers to the H bridges
 ### Dependencies
 
 librealsense
+
 ros2
+
 pygame
+
 zmq
+
+lerobot
+
+
 
 ## Recording data / arm control / driving / cameras
 
