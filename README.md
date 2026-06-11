@@ -18,7 +18,16 @@ zmq
 
 lerobot
 
+## BOM
 
+## Circuits
+
+## Robot features
+Move an object from point a to point b.
+- Static object type: e.g. a mug
+- Lerobot to grip the object
+- SLAM to first map the scene
+- SLAM to move object from A to point B
 
 ## Recording data / arm control / driving / cameras
 
