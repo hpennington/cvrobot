@@ -1,4 +1,7 @@
 # CVRobot
+This is a tracked robot chassis with a so 101 robotic arm attached to the top
+
+## Instructions
 
 ## Recording data / arm control / driving / cameras
 
