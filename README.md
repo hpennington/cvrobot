@@ -1,6 +1,9 @@
 # CVRobot
 This is a tracked robot chassis with a so 101 robotic arm attached to the top
 
+There is a Realsense D415 attached to the chassis
+The arduino is being used for the PWM drivers to the H bridges
+
 ## Instructions
 
 ### Dependencies
