@@ -53,17 +53,17 @@ python camera_sub.py
 
 ```bash
 # Terminal 1
-python ros2_ws/jetson_combined.py --foxglove
+python jetson_combined.py --foxglove
 ```
 
 ```bash
 # Terminal 2
-python ros2_ws/ros2_scan_bridge.py
+python ros2_scan_bridge.py
 ```
 
 ```bash
 # Terminal 3
-ros2 launch ros2_ws/slam_launch.py
+ros2 launch slam_launch.py
 ```
 
 ```bash
