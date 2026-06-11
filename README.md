@@ -32,6 +32,9 @@ Move an object from point a to point b.
 
 ## Recording data / arm control / driving / cameras
 
+### Flash the Arduino 
+Flash main.ino to the arduino as the speed controller
+
 ### On mac
 
 #### Terminal 1
