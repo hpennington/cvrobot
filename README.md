@@ -33,8 +33,10 @@ Move an object from point a to point b.
 ## Recording data / arm control / driving / cameras
 
 ### On mac
+
+#### Terminal 1
+
 ```bash
-# Terminal 1
 python leader_pub.py
 ```
 
