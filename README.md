@@ -28,6 +28,7 @@ Move an object from point a to point b.
 - Lerobot to grip the object
 - SLAM to first map the scene
 - SLAM to move object from A to point B
+- YOLO to identify the object and track
 
 ## Recording data / arm control / driving / cameras
 
