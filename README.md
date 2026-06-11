@@ -2,18 +2,20 @@
 
 ## Recording data / arm control / driving / cameras
 
+### On mac
 ```bash
 # Terminal 1
 python leader_pub.py
 ```
 
+### On jetson orin nano
 ```bash
-# Terminal 2 device 2
+# Terminal 1
 python follower_sub.py
 ```
 
 ```bash
-# Terminal 3 device 2
+# Terminal 2
 python camera_sub.py
 ```
 
