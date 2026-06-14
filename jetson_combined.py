@@ -85,14 +85,6 @@ def make_pub(port):
     return sock
 
 # ── Camera threads ────────────────────────────────────────────────────────────
-
-def capture_webcam():
-    sock = make_pub(WEBCAM_PORT)
-    cap = cv2.VideoCapture(WEBCAM_INDEX)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    print(f"[webcam] opened: {cap.isOpened()}")
-    while not stop_event.is_set():
         ret, frame = cap.read()
         if ret:
             with frame_locks["webcam"]:
@@ -139,9 +131,7 @@ def drive_loop():
     pygame.joystick.init()
 
     if pygame.joystick.get_count() == 0:
-        print("[joystick] no joystick detected — drive loop exiting")
-        return
-
+        print("[joystick] no joystick detected —
     joy = pygame.joystick.Joystick(0)
     joy.init()
     print(f"[joystick] {joy.get_name()}")
@@ -195,7 +185,6 @@ def drive_loop():
         print("[drive] stopped")
 
 # ── Follower helpers ──────────────────────────────────────────────────────────
-
 def _force_release_port(port: str) -> None:
     """
     Evict any stale file descriptor on the serial port by briefly opening it
@@ -227,11 +216,6 @@ def _port_alive(port: str) -> bool:
 
 
 # ── Follower loop ─────────────────────────────────────────────────────────────
-
-def follower_loop():
-    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-    global follower_instance, latest_action
-
     while not stop_event.is_set():
         follower    = None
         leader_sock = None
@@ -324,36 +308,6 @@ def follower_loop():
     print("[follower] thread exiting")
 
 # ── LeRobot recording ─────────────────────────────────────────────────────────
-
-def wait_for_key():
-    return select.select([sys.stdin], [], [], 0)[0]
-
-def wait_for_enter_or_discard():
-    while True:
-        line = sys.stdin.readline().strip().lower()
-        if line == 'd':
-            return False
-        return True
-
-def record_loop(task: str, num_episodes: int, repo_id: str):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    print("[record] waiting for follower arm...")
-    while True:
-        with follower_lock:
-            if follower_instance is not None:
-                break
-        time.sleep(0.1)
-    print("[record] follower ready")
-
-    features = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
-                      "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"],
-        },
-        "observation.images.webcam": {
             "dtype": "video",
             "shape": (480, 640, 3),
             "names": ["height", "width", "channels"],
@@ -384,34 +338,7 @@ def record_loop(task: str, num_episodes: int, repo_id: str):
         for episode_idx in range(num_episodes):
             input(f"\n[record] Press Enter to start episode {episode_idx + 1}/{num_episodes}...")
             dataset.clear_episode_buffer()
-            print("[record] Recording — press Enter to save, D+Enter to discard")
-
-            while True:
-                with follower_lock:
-                    obs = follower_instance.get_observation()
-
-                state = np.array([
-                    obs["shoulder_pan.pos"],
-                    obs["shoulder_lift.pos"],
-                    obs["elbow_flex.pos"],
-                    obs["wrist_flex.pos"],
-                    obs["wrist_roll.pos"],
-                    obs["gripper.pos"],
-                ], dtype=np.float32)
-
-                with action_lock:
-                    act = latest_action
-
-                if act is not None:
-                    action_vec = np.array([
-                        act["shoulder_pan.pos"],
-                        act["shoulder_lift.pos"],
-                        act["elbow_flex.pos"],
-                        act["wrist_flex.pos"],
-                        act["wrist_roll.pos"],
-                        act["gripper.pos"],
-                    ], dtype=np.float32)
-                else:
+            print("[record] Recording — pre
                     action_vec = state.copy()
 
                 with frame_locks["webcam"]:
