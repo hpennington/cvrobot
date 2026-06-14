@@ -5,15 +5,19 @@ jetson_combined.py
 - Reads gamepad and sends differential drive commands to Arduino over serial
 - Follower arm mirrors leader arm always
 - Records LeRobot episodes with follower arm + cameras
+- Foxglove WebSocket bridge for live visualisation in Foxglove Studio
 
 Run on Jetson:
     python jetson_combined.py
     python jetson_combined.py --record --task "pick up the cube" --num-episodes 10 --repo-id local/my-dataset
+    python jetson_combined.py --foxglove                     # stream to Foxglove Studio (port 8765)
+
+Install foxglove bridge dep:
+    pip install foxglove-websocket
 
 TODO (SLAM additions):
     - RGB-D ZMQ bridge (ports 5559/5560) → ros2_scan_bridge.py
     - IMU streaming from BNO08x over I2C → ZMQ port 5563
-    - Foxglove WebSocket bridge
 """
 
 import os
@@ -54,6 +58,10 @@ QUALITY         = 50
 WEBCAM_PORT     = 5556
 REALSENSE_PORT  = 5557
 
+# RTAB-Map / ZMQ bridge ports
+RGB_BRIDGE_PORT   = 5559  # raw BGR image bytes → ros2_scan_bridge.py
+DEPTH_BRIDGE_PORT = 5560  # raw uint16 depth bytes → ros2_scan_bridge.py
+
 FOLLOWER_PORT        = "/dev/ttyACM1"
 FOLLOWER_ID          = "my_awesome_follower_arm"
 LEADER_IP            = "10.0.0.53"
@@ -61,15 +69,30 @@ LEADER_ZMQ_PORT      = 5555
 FOLLOWER_RECONNECT_S = 3.0
 FOLLOWER_RECV_MS     = 500   # ZMQ timeout; triggers keepalive when leader is quiet
 
+# ── Robot geometry ────────────────────────────────────────────────────────────
+
+WHEEL_BASE      = 0.20   # distance between left and right wheels (metres) — tune to your car
+WHEEL_RADIUS    = 0.033  # driven wheel radius (metres) — tune to your car
+MAX_WHEEL_SPEED = 1.5    # rad/s at full command (|cmd| == 1.0) — tune to your car
+
+# ── Foxglove WebSocket bridge ─────────────────────────────────────────────────
+
+FOXGLOVE_PORT    = 8765
+FOXGLOVE_HZ_CAM  = 15
+FOXGLOVE_HZ_SLOW = 10
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-latest_frames    = {"webcam": None, "realsense": None}
-frame_locks      = {"webcam": threading.Lock(), "realsense": threading.Lock()}
+latest_frames    = {"webcam": None, "realsense": None, "depth": None}
+frame_locks      = {"webcam": threading.Lock(), "realsense": threading.Lock(), "depth": threading.Lock()}
 
 follower_instance = None
 follower_lock     = threading.Lock()
 latest_action     = None
 action_lock       = threading.Lock()
+
+drive_lock = threading.Lock()
+drive_cmd  = {"left": 0.0, "right": 0.0}  # normalised [-1, 1]
 
 stop_event = threading.Event()
 
@@ -85,6 +108,14 @@ def make_pub(port):
     return sock
 
 # ── Camera threads ────────────────────────────────────────────────────────────
+
+def capture_webcam():
+    sock = make_pub(WEBCAM_PORT)
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    print(f"[webcam] opened: {cap.isOpened()}")
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if ret:
             with frame_locks["webcam"]:
@@ -94,26 +125,86 @@ def make_pub(port):
     cap.release()
 
 def capture_realsense():
-    sock = make_pub(REALSENSE_PORT)
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    pipeline.start(config)
-    print("[realsense] started")
-    try:
-        while not stop_event.is_set():
-            frames = pipeline.wait_for_frames(timeout_ms=1000)
-            frame = frames.get_color_frame()
-            if not frame:
-                continue
-            img = np.asanyarray(frame.get_data())
-            with frame_locks["realsense"]:
-                latest_frames["realsense"] = img.copy()
-            _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
-            sock.send(buf.tobytes())
-    finally:
-        pipeline.stop()
-        print("[realsense] stopped")
+    """
+    Capture loop with depth alignment and automatic reconnection.
+
+    Publishes:
+      - JPEG colour on REALSENSE_PORT (Foxglove / recording)
+      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge →
+    torn down, we wait briefly, then try to reopen the device.
+    """
+    sock       = make_pub(REALSENSE_PORT)
+    rgb_sock   = make_pub(RGB_BRIDGE_PORT)
+    depth_sock = make_pub(DEPTH_BRIDGE_PORT)
+
+    TIMEOUT_MS       = 2000
+    CONSECUTIVE_MAX  = 5
+    RECONNECT_DELAY  = 3.0
+
+    while not stop_event.is_set():
+        pipeline = None
+        try:
+            pipeline = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
+            pipeline.start(cfg)
+            align = rs.align(rs.stream.color)
+            print("[realsense] started (colour + depth)")
+            consecutive_timeouts = 0
+
+            while not stop_event.is_set():
+                try:
+                    raw_frames = pipeline.wait_for_frames(timeout_ms=TIMEOUT_MS)
+                    consecutive_timeouts = 0
+                except RuntimeError as e:
+                    consecutive_timeouts += 1
+                    print(f"[realsense] frame timeout #{consecutive_timeouts}: {e}")
+                    if consecutive_timeouts >= CONSECUTIVE_MAX:
+                        print("[realsense] too many timeouts — reconnecting")
+                        break
+                    continue
+
+                frames = align.process(raw_frames)
+                color  = frames.get_color_frame()
+                depth  = frames.get_depth_frame()
+                if not color:
+                    continue
+
+                img = np.asanyarray(color.get_data())
+
+                with frame_locks["realsense"]:
+                    latest_frames["realsense"] = img.copy()
+                if depth:
+                    with frame_locks["depth"]:
+                        latest_frames["depth"] = np.asanyarray(depth.get_data()).copy()
+
+                # JPEG for Foxglove / recording
+                _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
+                sock.send(buf.tobytes())
+
+                # Raw frames for ros2_scan_bridge → RTAB-Map
+                h, w = img.shape[:2]
+                rgb_sock.send(np.array([h, w], dtype=np.int32).tobytes() + img.tobytes())
+                if depth:
+                    d_arr = np.asanyarray(depth.get_data())
+                    depth_sock.send(np.array([*d_arr.shape], dtype=np.int32).tobytes() + d_arr.tobytes())
+
+        except Exception as e:
+            print(f"[realsense] error: {e}")
+        finally:
+            if pipeline is not None:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+            print("[realsense] pipeline stopped")
+
+        if not stop_event.is_set():
+            print(f"[realsense] reconnecting in {RECONNECT_DELAY}s…")
+            time.sleep(RECONNECT_DELAY)
+
+    print("[realsense] thread exiting")
 
 # ── Serial helpers ────────────────────────────────────────────────────────────
 
@@ -132,31 +223,6 @@ def drive_loop():
 
     if pygame.joystick.get_count() == 0:
         print("[joystick] no joystick detected —
-    joy = pygame.joystick.Joystick(0)
-    joy.init()
-    print(f"[joystick] {joy.get_name()}")
-
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)
-    print(f"[serial] {SERIAL_PORT} @ {BAUD_RATE} baud")
-
-    prev_left = prev_right = None
-    min_interval = 1.0 / SEND_HZ if SEND_HZ > 0 else 0
-    last_send = last_keepalive = 0.0
-
-    try:
-        while not stop_event.is_set():
-            pygame.event.pump()
-            left  = normalise(joy.get_axis(LEFT_AXIS))
-            right = normalise(joy.get_axis(RIGHT_AXIS))
-            now   = time.monotonic()
-
-            changed = (
-                prev_left  is None or
-                prev_right is None or
-                abs(left  - prev_left)  > TOLERANCE or
-                abs(right - prev_right) > TOLERANCE
-            )
             ready = (now - last_send) >= min_interval
 
             if changed and ready:
@@ -166,6 +232,9 @@ def drive_loop():
                 prev_left = left
                 prev_right = right
                 last_send = last_keepalive = now
+                with drive_lock:
+                    drive_cmd["left"]  = -left
+                    drive_cmd["right"] = -right
             elif (now - last_keepalive) >= (1.0 / WATCHDOG_HZ):
                 pkt = build_packet(-prev_left or 0.0, -prev_right or 0.0)
                 ser.write(pkt)
@@ -185,6 +254,7 @@ def drive_loop():
         print("[drive] stopped")
 
 # ── Follower helpers ──────────────────────────────────────────────────────────
+
 def _force_release_port(port: str) -> None:
     """
     Evict any stale file descriptor on the serial port by briefly opening it
@@ -205,8 +275,6 @@ def _force_release_port(port: str) -> None:
         s.close()
         print(f"[follower] force-released {port}")
     except Exception as e:
-        # Don't let a failed eviction prevent a connect attempt.
-        # The SDK open may still succeed if nothing was actually holding it.
         print(f"[follower] port release warning: {e}")
 
 
@@ -216,13 +284,15 @@ def _port_alive(port: str) -> bool:
 
 
 # ── Follower loop ─────────────────────────────────────────────────────────────
+    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+    global follower_instance, latest_action
+
     while not stop_event.is_set():
         follower    = None
         leader_sock = None
         last_action = None
 
         try:
-            # Evict any stale fd before the SDK opens the port.
             _force_release_port(FOLLOWER_PORT)
 
             cfg      = SO101FollowerConfig(port=FOLLOWER_PORT, id=FOLLOWER_ID)
@@ -230,15 +300,12 @@ def _port_alive(port: str) -> bool:
             follower.connect()
             print(f"[follower] connected on {FOLLOWER_PORT}")
 
-            # Expose only after connect() fully returns.
             with follower_lock:
                 follower_instance = follower
 
-            # Subscribe to leader.
             leader_sock = zmq_ctx.socket(zmq.SUB)
-            leader_sock.setsockopt(zmq.RCVHWM, 1)
-            leader_sock.setsockopt(zmq.CONFLATE, 1)
-            # Non-blocking poll so we can send keepalives and check port health.
+            leader_sock.setsockopt(zmq.RCVHWM, 200)  # buffer commands; CONFLATE must be OFF for arm
+            leader_sock.setsockopt(zmq.CONFLATE, 0)   # deliver every joint command in order
             leader_sock.setsockopt(zmq.RCVTIMEO, FOLLOWER_RECV_MS)
             leader_sock.connect(f"tcp://{LEADER_IP}:{LEADER_ZMQ_PORT}")
             leader_sock.setsockopt(zmq.SUBSCRIBE, b"")
@@ -246,12 +313,10 @@ def _port_alive(port: str) -> bool:
 
             while not stop_event.is_set():
 
-                # Bail early if USB disappeared — avoids a noisy SDK write failure.
                 if not _port_alive(FOLLOWER_PORT):
                     print(f"[follower] {FOLLOWER_PORT} disappeared — reconnecting")
                     break
 
-                # Receive command, or use last known position as keepalive.
                 action = None
                 try:
                     msg    = leader_sock.recv_string()
@@ -260,7 +325,6 @@ def _port_alive(port: str) -> bool:
                     action = last_action  # keepalive: hold last position
 
                 if action is None:
-                    # No message received yet since (re)connect.
                     continue
 
                 try:
@@ -273,8 +337,6 @@ def _port_alive(port: str) -> bool:
                 except Exception as e:
                     err = str(e)
                     print(f"[follower] send_action failed: {err}")
-                    # Hard SDK port errors → full reconnect (evicts stale fd).
-                    # Transient per-servo errors (CRC, single timeout) → continue.
                     if "Port is in use" in err or "TxRxResult" in err:
                         print("[follower] SDK port error — triggering reconnect")
                         break
@@ -285,8 +347,6 @@ def _port_alive(port: str) -> bool:
         except Exception as e:
             print(f"[follower] error: {e}")
         finally:
-            # Hide instance before disconnecting so other threads don't
-            # call send_action on a closing handle.
             with follower_lock:
                 follower_instance = None
             if leader_sock is not None:
@@ -307,7 +367,206 @@ def _port_alive(port: str) -> bool:
 
     print("[follower] thread exiting")
 
+
+# ── Foxglove WebSocket bridge ─────────────────────────────────────────────────
+#
+# Uses the official `foxglove-websocket` Python library (no ROS2 required).
+# Publishes these channels to Foxglove Studio:
+#
+#   /camera/webcam          foxglove.CompressedImage
+#   /camera/realsense       foxglove.CompressedImage
+#   /odom                   foxglove.PosesInFrame   (identity — SLAM pose comes from ROS2 TF)
+#   /drive_cmd              foxglove.Twist
+#   /arm/joint_states       foxglove.JointState
+#
+# Connect from Foxglove Studio: File → Open connection → WebSocket →
+        "foxglove.JointState": {
+            "title": "JointState",
+            "type": "object",
+            "properties": {
+                "timestamp":  {"type": "object",
+                               "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":   {"type": "string"},
+                "name":       {"type": "array", "items": {"type": "string"}},
+                "position":   {"type": "array", "items": {"type": "number"}},
+                "velocity":   {"type": "array", "items": {"type": "number"}},
+                "effort":     {"type": "array", "items": {"type": "number"}},
+            },
+        },
+    }
+    return schemas[name]
+
+
+def _ts(t: float) -> dict:
+    sec  = int(t)
+    nsec = int((t - sec) * 1e9)
+    return {"sec": sec, "nsec": nsec}
+
+
+def foxglove_bridge():
+    import asyncio
+    import base64
+
+    try:
+        from foxglove_websocket.server import FoxgloveServer
+    except ImportError:
+        print("[foxglove] 'foxglove-websocket' not installed — skipping bridge")
+        print("[foxglove] Install with: pip install foxglove-websocket")
+        return
+
+    ARM_JOINT_NAMES = [
+        "shoulder_pan",
+                "encoding":   "json",
+                "schemaName": "foxglove.CompressedImage",
+                "schema":     json.dumps(_foxglove_schema("foxglove.CompressedImage")),
+            })
+            ch_rs = await server.add_channel({
+                "topic":      "/camera/realsense",
+                "encoding":   "json",
+                "schemaName": "foxglove.CompressedImage",
+                "schema":     json.dumps(_foxglove_schema("foxglove.CompressedImage")),
+            })
+            ch_odom = await server.add_channel({
+                "topic":      "/odom",
+                "encoding":   "json",
+                "schemaName": "foxglove.PosesInFrame",
+                "schema":     json.dumps(_foxglove_schema("foxglove.PosesInFrame")),
+            })
+            ch_drive = await server.add_channel({
+                "topic":      "/drive_cmd",
+                "encoding":   "json",
+                "schemaName": "foxglove.Twist",
+                "schema":     json.dumps(_foxglove_schema("foxglove.Twist")),
+            })
+            ch_joints = await server.add_channel({
+                "topic":      "/arm/joint_states",
+                "encoding":   "json",
+                "schemaName": "foxglove.JointState",
+                "schema":     json.dumps(_foxglove_schema("foxglove.JointState")),
+            })
+
+            print(f"[foxglove] server live on ws://0.0.0.0:{FOXGLOVE_PORT}")
+            print(f"[foxglove] connect Foxglove Studio → ws://<jetson-ip>:{FOXGLOVE_PORT}")
+
+            cam_interval  = 1.0 / FOXGLOVE_HZ_CAM
+            slow_interval = 1.0 / FOXGLOVE_HZ_SLOW
+            last_cam  = 0.0
+            last_slow = 0.0
+
+            while not stop_event.is_set():
+                now = time.monotonic()
+                ts  = _ts(time.time())
+
+                # ── Cameras ───────────────────────────────────────────────
+                    with frame_locks["webcam"]:
+                        wf = latest_frames.get("webcam")
+                    if wf is not None:
+                        _, buf = cv2.imencode(".jpg", wf, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
+                        await server.send_message(
+                            ch_webcam,
+                            int(time.time() * 1e9),
+                            json.dumps({
+                                "timestamp": ts,
+                                "frame_id":  "webcam",
+                                "format":    "jpeg",
+                                "data":      base64.b64encode(buf.tobytes()).decode(),
+                            }).encode(),
+                        )
+
+                    with frame_locks["realsense"]:
+                        rf = latest_frames.get("realsense")
+                    if rf is not None:
+                        _, buf = cv2.imencode(".jpg", rf, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
+                        await server.send_message(
+                            ch_rs,
+                            int(time.time() * 1e9),
+                            json.dumps({
+                                "timestamp": ts,
+                                "frame_id":  "realsense_color",
+                                "format":    "jpeg",
+                                "data":      base64.b64encode(buf.tobytes()).decode(),
+                            }).encode(),
+                        )
+
+                # ── Slow channels ─────────────────────────────────────────
+                if now - last_slow >= slow_interval:
+                    last_slow = now
+
+                    # Identity pose — real SLAM pose comes from ROS2 TF if slam_launch.py is running
+                    await server.send_message(
+                        ch_odom,
+                        int(time.time() * 1e9),
+                        json.dumps({
+                            "timestamp": ts,
+                            "frame_id":  "map",
+                            "poses": [{
+                                "position":    {"x": 0.0, "y": 0.0, "z": 0.0},
+                                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                            }],
+                        }).encode(),
+                    )
+
+                    with drive_lock:
+                        l_cmd = drive_cmd["left"]
+                        r_cmd = drive_cmd["right"]
+                    lin_x = (l_cmd + r_cmd) / 2.0 * MAX_WHEEL_SPEED * WHEEL_RADIUS
+                    ang_z = (r_cmd - l_cmd) / WHEEL_BASE * WHEEL_RADIUS
+                    await server.send_message(
+                        ch_drive,
+                        int(time.time() * 1e9),
+                        json.dumps({
+                            "linear":  {"x": lin_x, "y": 0.0, "z": 0.0},
+                            "angular": {"x": 0.0,   "y": 0.0, "z": ang_z},
+                        }).encode(),
+                    )
+
+                    # Read last known joint positions from shared state instead
+                    # of calling get_observation() — avoids concurrent serial
+                    # access that triggers Dynamixel "Port is in use" errors.
+                    with action_lock:
+                        act = latest_action
+                    if act is not None:
+                        positions = [act.get(f"{name}.pos", 0.0) for name in ARM_JOINT_NAMES]
+                        await server.send_message(
+                            ch_joints,
+                            int(time.time() * 1e9),
+                            json.dumps({
+                                "timestamp": ts,
+                                "frame_id":  "base_link",
+                                "name":      ARM_JOINT_NAMES,
+                                "position":  positions,
+                                "velocity":  [0.0] * 6,
+                                "effort":    [0.0] * 6,
+                            }).encode(),
+                        )
+
+                await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+
 # ── LeRobot recording ─────────────────────────────────────────────────────────
+        return True
+
+def record_loop(task: str, num_episodes: int, repo_id: str):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    print("[record] waiting for follower arm...")
+    while True:
+        with follower_lock:
+            if follower_instance is not None:
+                break
+        time.sleep(0.1)
+    print("[record] follower ready")
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
+                      "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"],
+        },
+        "observation.images.webcam": {
             "dtype": "video",
             "shape": (480, 640, 3),
             "names": ["height", "width", "channels"],
@@ -338,7 +597,7 @@ def _port_alive(port: str) -> bool:
         for episode_idx in range(num_episodes):
             input(f"\n[record] Press Enter to start episode {episode_idx + 1}/{num_episodes}...")
             dataset.clear_episode_buffer()
-            print("[record] Recording — pre
+            print("[record] Recording —
                     action_vec = state.copy()
 
                 with frame_locks["webcam"]:
@@ -382,6 +641,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-episodes", type=int, default=10)
     parser.add_argument("--repo-id",      type=str, default="local/robot-dataset")
     parser.add_argument("--record",       action="store_true")
+    parser.add_argument("--foxglove",     action="store_true",
+                        help=f"Start Foxglove WebSocket bridge on port {FOXGLOVE_PORT}")
     args = parser.parse_args()
 
     threading.Thread(target=capture_webcam,    daemon=True).start()
@@ -389,10 +650,14 @@ if __name__ == "__main__":
     threading.Thread(target=drive_loop,        daemon=True).start()
     threading.Thread(target=follower_loop,     daemon=True).start()
 
+    if args.foxglove:
+        threading.Thread(target=foxglove_bridge, daemon=True).start()
+
     if args.record:
         record_loop(args.task, args.num_episodes, args.repo_id)
     else:
         print("Running. Ctrl-C to stop.")
+        print("Tip: add --foxglove to stream cameras/drive/arm to Foxglove Studio")
         try:
             threading.Event().wait()
         except KeyboardInterrupt:
