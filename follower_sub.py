@@ -44,14 +44,14 @@ RIGHT_AXIS      = 3
 SEND_HZ         = 10
 WATCHDOG_HZ     = 4
 
-WEBCAM_INDEX    = 0
+WEBCAM_INDEX    = 6
 QUALITY         = 50
 WEBCAM_PORT     = 5556
 REALSENSE_PORT  = 5557
 
 FOLLOWER_PORT   = "/dev/ttyACM1"
 FOLLOWER_ID     = "my_awesome_follower_arm"
-LEADER_IP       = "10.0.0.10"
+LEADER_IP       = "10.0.0.53"
 LEADER_ZMQ_PORT = 5555
 
 # ── Shared state ──────────────────────────────────────────────────────────────
