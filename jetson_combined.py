@@ -130,7 +130,9 @@ def capture_realsense():
 
     Publishes:
       - JPEG colour on REALSENSE_PORT (Foxglove / recording)
-      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge →
+      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge → RTAB-Map)
+
+    If wait_for_frames() times out or any RuntimeError occurs the pipeline is
     torn down, we wait briefly, then try to reopen the device.
     """
     sock       = make_pub(REALSENSE_PORT)
@@ -222,7 +224,34 @@ def drive_loop():
     pygame.joystick.init()
 
     if pygame.joystick.get_count() == 0:
-        print("[joystick] no joystick detected —
+        print("[joystick] no joystick detected — drive loop exiting")
+        return
+
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+    print(f"[joystick] {joy.get_name()}")
+
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print(f"[serial] {SERIAL_PORT} @ {BAUD_RATE} baud")
+
+    prev_left = prev_right = None
+    min_interval = 1.0 / SEND_HZ if SEND_HZ > 0 else 0
+    last_send = last_keepalive = 0.0
+
+    try:
+        while not stop_event.is_set():
+            pygame.event.pump()
+            left  = normalise(joy.get_axis(LEFT_AXIS))
+            right = normalise(joy.get_axis(RIGHT_AXIS))
+            now   = time.monotonic()
+
+            changed = (
+                prev_left  is None or
+                prev_right is None or
+                abs(left  - prev_left)  > TOLERANCE or
+                abs(right - prev_right) > TOLERANCE
+            )
             ready = (now - last_send) >= min_interval
 
             if changed and ready:
@@ -284,6 +313,8 @@ def _port_alive(port: str) -> bool:
 
 
 # ── Follower loop ─────────────────────────────────────────────────────────────
+
+def follower_loop():
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     global follower_instance, latest_action
 
@@ -379,7 +410,50 @@ def _port_alive(port: str) -> bool:
 #   /drive_cmd              foxglove.Twist
 #   /arm/joint_states       foxglove.JointState
 #
-# Connect from Foxglove Studio: File → Open connection → WebSocket →
+# Connect from Foxglove Studio: File → Open connection → WebSocket → ws://<ip>:8765
+
+def _foxglove_schema(name: str) -> dict:
+    schemas = {
+        "foxglove.CompressedImage": {
+            "title": "CompressedImage",
+            "type": "object",
+            "properties": {
+                "timestamp":  {"type": "object",
+                               "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":   {"type": "string"},
+                "data":       {"type": "string", "contentEncoding": "base64"},
+                "format":     {"type": "string"},
+            },
+        },
+        "foxglove.PosesInFrame": {
+            "title": "PosesInFrame",
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "object",
+                              "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":  {"type": "string"},
+                "poses": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "position":    {"type": "object",
+                                           "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                            "orientation": {"type": "object",
+                                           "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "w": {"type": "number"}}},
+                        },
+                    },
+                },
+            },
+        },
+        "foxglove.Twist": {
+            "title": "Twist",
+            "type": "object",
+            "properties": {
+                "linear":  {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                "angular": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+            },
+        },
         "foxglove.JointState": {
             "title": "JointState",
             "type": "object",
@@ -415,7 +489,19 @@ def foxglove_bridge():
         return
 
     ARM_JOINT_NAMES = [
-        "shoulder_pan",
+        "shoulder_pan", "shoulder_lift", "elbow_flex",
+        "wrist_flex", "wrist_roll", "gripper",
+    ]
+
+    async def run():
+        async with FoxgloveServer(
+            host="0.0.0.0",
+            port=FOXGLOVE_PORT,
+            name="jetson_robot",
+        ) as server:
+
+            ch_webcam = await server.add_channel({
+                "topic":      "/camera/webcam",
                 "encoding":   "json",
                 "schemaName": "foxglove.CompressedImage",
                 "schema":     json.dumps(_foxglove_schema("foxglove.CompressedImage")),
@@ -458,6 +544,9 @@ def foxglove_bridge():
                 ts  = _ts(time.time())
 
                 # ── Cameras ───────────────────────────────────────────────
+                if now - last_cam >= cam_interval:
+                    last_cam = now
+
                     with frame_locks["webcam"]:
                         wf = latest_frames.get("webcam")
                     if wf is not None:
@@ -546,6 +635,15 @@ def foxglove_bridge():
 
 
 # ── LeRobot recording ─────────────────────────────────────────────────────────
+
+def wait_for_key():
+    return select.select([sys.stdin], [], [], 0)[0]
+
+def wait_for_enter_or_discard():
+    while True:
+        line = sys.stdin.readline().strip().lower()
+        if line == 'd':
+            return False
         return True
 
 def record_loop(task: str, num_episodes: int, repo_id: str):
@@ -597,7 +695,34 @@ def record_loop(task: str, num_episodes: int, repo_id: str):
         for episode_idx in range(num_episodes):
             input(f"\n[record] Press Enter to start episode {episode_idx + 1}/{num_episodes}...")
             dataset.clear_episode_buffer()
-            print("[record] Recording —
+            print("[record] Recording — press Enter to save, D+Enter to discard")
+
+            while True:
+                with follower_lock:
+                    obs = follower_instance.get_observation()
+
+                state = np.array([
+                    obs["shoulder_pan.pos"],
+                    obs["shoulder_lift.pos"],
+                    obs["elbow_flex.pos"],
+                    obs["wrist_flex.pos"],
+                    obs["wrist_roll.pos"],
+                    obs["gripper.pos"],
+                ], dtype=np.float32)
+
+                with action_lock:
+                    act = latest_action
+
+                if act is not None:
+                    action_vec = np.array([
+                        act["shoulder_pan.pos"],
+                        act["shoulder_lift.pos"],
+                        act["elbow_flex.pos"],
+                        act["wrist_flex.pos"],
+                        act["wrist_roll.pos"],
+                        act["gripper.pos"],
+                    ], dtype=np.float32)
+                else:
                     action_vec = state.copy()
 
                 with frame_locks["webcam"]:
