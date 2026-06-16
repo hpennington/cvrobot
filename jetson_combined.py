@@ -6,6 +6,7 @@ jetson_combined.py
 - Follower arm mirrors leader arm always
 - Records LeRobot episodes with follower arm + cameras
 - Foxglove WebSocket bridge for live visualisation in Foxglove Studio
+- BNO08x IMU streaming over ZMQ (port 5563) for ros2_scan_bridge / RTAB-Map gravity fusion
 
 Run on Jetson:
     python jetson_combined.py
@@ -15,9 +16,8 @@ Run on Jetson:
 Install foxglove bridge dep:
     pip install foxglove-websocket
 
-TODO (SLAM additions):
-    - RGB-D ZMQ bridge (ports 5559/5560) → ros2_scan_bridge.py
-    - IMU streaming from BNO08x over I2C → ZMQ port 5563
+Install IMU dep:
+    pip install adafruit-circuitpython-bno08x
 """
 
 import os
@@ -61,6 +61,7 @@ REALSENSE_PORT  = 5557
 # RTAB-Map / ZMQ bridge ports
 RGB_BRIDGE_PORT   = 5559  # raw BGR image bytes → ros2_scan_bridge.py
 DEPTH_BRIDGE_PORT = 5560  # raw uint16 depth bytes → ros2_scan_bridge.py
+IMU_BRIDGE_PORT   = 5563  # JSON accel/gyro/quat → ros2_scan_bridge.py
 
 FOLLOWER_PORT        = "/dev/ttyACM1"
 FOLLOWER_ID          = "my_awesome_follower_arm"
@@ -71,15 +72,21 @@ FOLLOWER_RECV_MS     = 500   # ZMQ timeout; triggers keepalive when leader is qu
 
 # ── Robot geometry ────────────────────────────────────────────────────────────
 
-WHEEL_BASE      = 0.20   # distance between left and right wheels (metres) — tune to your car
+WHEEL_BASE      = 0.10   # distance between left and right wheels (metres) — tune to your car
 WHEEL_RADIUS    = 0.033  # driven wheel radius (metres) — tune to your car
-MAX_WHEEL_SPEED = 1.5    # rad/s at full command (|cmd| == 1.0) — tune to your car
+MAX_WHEEL_SPEED = 6.28    # rad/s at full command (|cmd| == 1.0) — tune to your car
 
 # ── Foxglove WebSocket bridge ─────────────────────────────────────────────────
 
 FOXGLOVE_PORT    = 8765
 FOXGLOVE_HZ_CAM  = 15
 FOXGLOVE_HZ_SLOW = 10
+
+# ── IMU (BNO08x over I2C) ────────────────────────────────────────────────────
+
+IMU_STARTUP_DELAY = 5.0   # seconds — let RealSense claim USB before I2C init
+IMU_HZ            = 200   # sensor report rate (Hz)
+IMU_I2C_ADDR      = 0x4B
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -93,6 +100,9 @@ action_lock       = threading.Lock()
 
 drive_lock = threading.Lock()
 drive_cmd  = {"left": 0.0, "right": 0.0}  # normalised [-1, 1]
+
+imu_lock = threading.Lock()
+latest_imu = None  # dict: {"accel": (x,y,z), "gyro": (x,y,z), "quat": (i,j,k,w)}
 
 stop_event = threading.Event()
 
@@ -124,21 +134,51 @@ def capture_webcam():
             sock.send(buf.tobytes())
     cap.release()
 
+def _rs_hardware_reset():
+    """Issue a USB hardware reset to all connected RealSense devices."""
+    try:
+        ctx = rs.context()
+        for dev in ctx.query_devices():
+            serial = dev.get_info(rs.camera_info.serial_number)
+            print(f"[realsense] hardware reset → {serial}")
+            dev.hardware_reset()
+        time.sleep(2.0)  # device needs time to re-enumerate on USB
+    except Exception as e:
+        print(f"[realsense] hardware reset failed: {e}")
+
+
+def _disable_usb_autosuspend():
+    """Disable USB autosuspend to prevent the kernel from powering down the camera."""
+    try:
+        import glob
+        for path in glob.glob("/sys/bus/usb/devices/*/power/autosuspend_delay_ms"):
+            with open(path, "w") as f:
+                f.write("-1")
+        print("[realsense] USB autosuspend disabled")
+    except Exception as e:
+        print(f"[realsense] could not disable USB autosuspend: {e}")
+
+
 def capture_realsense():
     """
     Capture loop with depth alignment and automatic reconnection.
 
     Publishes:
       - JPEG colour on REALSENSE_PORT (Foxglove / recording)
-      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge →
-    torn down, we wait briefly, then try to reopen the device.
+      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge → RTAB-Map)
+
+    Uses try_wait_for_frames (non-throwing) instead of wait_for_frames to avoid
+    hanging on USB stalls.  Issues a hardware reset before each reconnect attempt.
     """
+    _disable_usb_autosuspend()
+
     sock       = make_pub(REALSENSE_PORT)
     rgb_sock   = make_pub(RGB_BRIDGE_PORT)
     depth_sock = make_pub(DEPTH_BRIDGE_PORT)
 
     TIMEOUT_MS       = 2000
     CONSECUTIVE_MAX  = 5
+    STALE_TIMEOUT    = 5.0    # seconds with no new frames → force reconnect
     RECONNECT_DELAY  = 3.0
 
     while not stop_event.is_set():
@@ -147,30 +187,41 @@ def capture_realsense():
             pipeline = rs.pipeline()
             cfg = rs.config()
             cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
+            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
             pipeline.start(cfg)
-            align = rs.align(rs.stream.color)
+            #align = rs.align(rs.stream.color)
             print("[realsense] started (colour + depth)")
             consecutive_timeouts = 0
+            last_good_frame = time.monotonic()
 
             while not stop_event.is_set():
-                try:
-                    raw_frames = pipeline.wait_for_frames(timeout_ms=TIMEOUT_MS)
-                    consecutive_timeouts = 0
-                except RuntimeError as e:
+                # Non-throwing: returns (success, frameset) instead of
+                # hanging indefinitely on USB stalls.
+                success, raw_frames = pipeline.try_wait_for_frames(TIMEOUT_MS)
+
+                if not success:
                     consecutive_timeouts += 1
-                    print(f"[realsense] frame timeout #{consecutive_timeouts}: {e}")
+                    print(f"[realsense] frame timeout #{consecutive_timeouts}")
                     if consecutive_timeouts >= CONSECUTIVE_MAX:
                         print("[realsense] too many timeouts — reconnecting")
                         break
                     continue
 
-                frames = align.process(raw_frames)
+                # Staleness check: if we got a frameset but haven't had a
+                # usable colour frame in STALE_TIMEOUT seconds, force restart.
+                consecutive_timeouts = 0
+
+                #frames = align.process(raw_frames)
+                frames = raw_frames
                 color  = frames.get_color_frame()
                 depth  = frames.get_depth_frame()
                 if not color:
+                    if (time.monotonic() - last_good_frame) > STALE_TIMEOUT:
+                        print("[realsense] no colour frames — stale, reconnecting")
+                        break
                     continue
 
+                last_good_frame = time.monotonic()
                 img = np.asanyarray(color.get_data())
 
                 with frame_locks["realsense"]:
@@ -201,7 +252,8 @@ def capture_realsense():
             print("[realsense] pipeline stopped")
 
         if not stop_event.is_set():
-            print(f"[realsense] reconnecting in {RECONNECT_DELAY}s…")
+            print(f"[realsense] hardware reset + reconnect in {RECONNECT_DELAY}s…")
+            _rs_hardware_reset()
             time.sleep(RECONNECT_DELAY)
 
     print("[realsense] thread exiting")
@@ -222,7 +274,34 @@ def drive_loop():
     pygame.joystick.init()
 
     if pygame.joystick.get_count() == 0:
-        print("[joystick] no joystick detected —
+        print("[joystick] no joystick detected — drive loop exiting")
+        return
+
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+    print(f"[joystick] {joy.get_name()}")
+
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print(f"[serial] {SERIAL_PORT} @ {BAUD_RATE} baud")
+
+    prev_left = prev_right = None
+    min_interval = 1.0 / SEND_HZ if SEND_HZ > 0 else 0
+    last_send = last_keepalive = 0.0
+
+    try:
+        while not stop_event.is_set():
+            pygame.event.pump()
+            left  = normalise(joy.get_axis(LEFT_AXIS))
+            right = normalise(joy.get_axis(RIGHT_AXIS))
+            now   = time.monotonic()
+
+            changed = (
+                prev_left  is None or
+                prev_right is None or
+                abs(left  - prev_left)  > TOLERANCE or
+                abs(right - prev_right) > TOLERANCE
+            )
             ready = (now - last_send) >= min_interval
 
             if changed and ready:
@@ -284,6 +363,8 @@ def _port_alive(port: str) -> bool:
 
 
 # ── Follower loop ─────────────────────────────────────────────────────────────
+
+def follower_loop():
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     global follower_instance, latest_action
 
@@ -368,6 +449,88 @@ def _port_alive(port: str) -> bool:
     print("[follower] thread exiting")
 
 
+# ── IMU thread (BNO08x) ──────────────────────────────────────────────────────
+
+def imu_loop():
+    """
+    Read BNO08x over I2C (bus 7 on Yahboom Jetson carrier) and publish
+    accel/gyro/quaternion as JSON over ZMQ.  Delays startup to avoid
+    contention with RealSense USB init.
+    """
+    global latest_imu
+
+    print(f"[imu] waiting {IMU_STARTUP_DELAY}s for RealSense to initialise…")
+    time.sleep(IMU_STARTUP_DELAY)
+
+    imu_sock = make_pub(IMU_BRIDGE_PORT)
+
+    try:
+        import board
+        import busio
+        from adafruit_bno08x.i2c import BNO08X_I2C
+        from adafruit_bno08x import (
+            BNO_REPORT_ACCELEROMETER,
+            BNO_REPORT_GYROSCOPE,
+            BNO_REPORT_ROTATION_VECTOR,
+        )
+    except ImportError as e:
+        print(f"[imu] missing dependency: {e}")
+        print("[imu] pip install adafruit-circuitpython-bno08x")
+        return
+
+    RECONNECT_DELAY = 3.0
+    report_interval_us = int(1e6 / IMU_HZ)  # microseconds
+
+    while not stop_event.is_set():
+        try:
+            # Blinka maps board.SCL/SDA → I2C bus 7 on Yahboom carrier
+            i2c = busio.I2C(board.SCL, board.SDA)
+            bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR)
+
+            bno.enable_feature(BNO_REPORT_ACCELEROMETER,   report_interval_us)
+            bno.enable_feature(BNO_REPORT_GYROSCOPE,       report_interval_us)
+            bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, report_interval_us)
+            print(f"[imu] BNO08x ready at 0x{IMU_I2C_ADDR:02X}, {IMU_HZ}Hz")
+
+            interval = 1.0 / IMU_HZ
+
+            while not stop_event.is_set():
+                t0 = time.monotonic()
+
+                accel = bno.acceleration      # (ax, ay, az) m/s²
+                gyro  = bno.gyro              # (gx, gy, gz) rad/s
+                quat  = bno.quaternion        # (i, j, k, w)
+
+                if accel is None or gyro is None or quat is None:
+                    time.sleep(0.01)
+                    continue
+
+                imu_data = {
+                    "accel": list(accel),
+                    "gyro":  list(gyro),
+                    "quat":  list(quat),       # [i, j, k, w]
+                    "t":     time.time(),
+                }
+
+                with imu_lock:
+                    latest_imu = imu_data
+
+                imu_sock.send_string(json.dumps(imu_data))
+
+                elapsed = time.monotonic() - t0
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+        except Exception as e:
+            print(f"[imu] error: {e}")
+
+        if not stop_event.is_set():
+            print(f"[imu] reconnecting in {RECONNECT_DELAY}s…")
+            time.sleep(RECONNECT_DELAY)
+
+    print("[imu] thread exiting")
+
+
 # ── Foxglove WebSocket bridge ─────────────────────────────────────────────────
 #
 # Uses the official `foxglove-websocket` Python library (no ROS2 required).
@@ -378,8 +541,52 @@ def _port_alive(port: str) -> bool:
 #   /odom                   foxglove.PosesInFrame   (identity — SLAM pose comes from ROS2 TF)
 #   /drive_cmd              foxglove.Twist
 #   /arm/joint_states       foxglove.JointState
+#   /imu                    foxglove.Imu            (BNO08x accel/gyro/quaternion)
 #
-# Connect from Foxglove Studio: File → Open connection → WebSocket →
+# Connect from Foxglove Studio: File → Open connection → WebSocket → ws://<ip>:8765
+
+def _foxglove_schema(name: str) -> dict:
+    schemas = {
+        "foxglove.CompressedImage": {
+            "title": "CompressedImage",
+            "type": "object",
+            "properties": {
+                "timestamp":  {"type": "object",
+                               "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":   {"type": "string"},
+                "data":       {"type": "string", "contentEncoding": "base64"},
+                "format":     {"type": "string"},
+            },
+        },
+        "foxglove.PosesInFrame": {
+            "title": "PosesInFrame",
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "object",
+                              "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":  {"type": "string"},
+                "poses": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "position":    {"type": "object",
+                                           "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                            "orientation": {"type": "object",
+                                           "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "w": {"type": "number"}}},
+                        },
+                    },
+                },
+            },
+        },
+        "foxglove.Twist": {
+            "title": "Twist",
+            "type": "object",
+            "properties": {
+                "linear":  {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                "angular": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+            },
+        },
         "foxglove.JointState": {
             "title": "JointState",
             "type": "object",
@@ -391,6 +598,24 @@ def _port_alive(port: str) -> bool:
                 "position":   {"type": "array", "items": {"type": "number"}},
                 "velocity":   {"type": "array", "items": {"type": "number"}},
                 "effort":     {"type": "array", "items": {"type": "number"}},
+            },
+        },
+        "foxglove.Imu": {
+            "title": "Imu",
+            "type": "object",
+            "properties": {
+                "timestamp":            {"type": "object",
+                                         "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+                "frame_id":             {"type": "string"},
+                "orientation":          {"type": "object",
+                                         "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                                        "z": {"type": "number"}, "w": {"type": "number"}}},
+                "angular_velocity":     {"type": "object",
+                                         "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                                        "z": {"type": "number"}}},
+                "linear_acceleration":  {"type": "object",
+                                         "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                                        "z": {"type": "number"}}},
             },
         },
     }
@@ -415,7 +640,19 @@ def foxglove_bridge():
         return
 
     ARM_JOINT_NAMES = [
-        "shoulder_pan",
+        "shoulder_pan", "shoulder_lift", "elbow_flex",
+        "wrist_flex", "wrist_roll", "gripper",
+    ]
+
+    async def run():
+        async with FoxgloveServer(
+            host="0.0.0.0",
+            port=FOXGLOVE_PORT,
+            name="jetson_robot",
+        ) as server:
+
+            ch_webcam = await server.add_channel({
+                "topic":      "/camera/webcam",
                 "encoding":   "json",
                 "schemaName": "foxglove.CompressedImage",
                 "schema":     json.dumps(_foxglove_schema("foxglove.CompressedImage")),
@@ -444,6 +681,12 @@ def foxglove_bridge():
                 "schemaName": "foxglove.JointState",
                 "schema":     json.dumps(_foxglove_schema("foxglove.JointState")),
             })
+            ch_imu = await server.add_channel({
+                "topic":      "/imu",
+                "encoding":   "json",
+                "schemaName": "foxglove.Imu",
+                "schema":     json.dumps(_foxglove_schema("foxglove.Imu")),
+            })
 
             print(f"[foxglove] server live on ws://0.0.0.0:{FOXGLOVE_PORT}")
             print(f"[foxglove] connect Foxglove Studio → ws://<jetson-ip>:{FOXGLOVE_PORT}")
@@ -458,6 +701,9 @@ def foxglove_bridge():
                 ts  = _ts(time.time())
 
                 # ── Cameras ───────────────────────────────────────────────
+                if now - last_cam >= cam_interval:
+                    last_cam = now
+
                     with frame_locks["webcam"]:
                         wf = latest_frames.get("webcam")
                     if wf is not None:
@@ -540,12 +786,40 @@ def foxglove_bridge():
                             }).encode(),
                         )
 
+                    # IMU
+                    with imu_lock:
+                        imu = latest_imu
+                    if imu is not None:
+                        q = imu["quat"]   # [i, j, k, w]
+                        g = imu["gyro"]   # [x, y, z]
+                        a = imu["accel"]  # [x, y, z]
+                        await server.send_message(
+                            ch_imu,
+                            int(time.time() * 1e9),
+                            json.dumps({
+                                "timestamp":           ts,
+                                "frame_id":            "imu_link",
+                                "orientation":         {"x": q[0], "y": q[1], "z": q[2], "w": q[3]},
+                                "angular_velocity":    {"x": g[0], "y": g[1], "z": g[2]},
+                                "linear_acceleration": {"x": a[0], "y": a[1], "z": a[2]},
+                            }).encode(),
+                        )
+
                 await asyncio.sleep(0.01)
 
     asyncio.run(run())
 
 
 # ── LeRobot recording ─────────────────────────────────────────────────────────
+
+def wait_for_key():
+    return select.select([sys.stdin], [], [], 0)[0]
+
+def wait_for_enter_or_discard():
+    while True:
+        line = sys.stdin.readline().strip().lower()
+        if line == 'd':
+            return False
         return True
 
 def record_loop(task: str, num_episodes: int, repo_id: str):
@@ -597,7 +871,34 @@ def record_loop(task: str, num_episodes: int, repo_id: str):
         for episode_idx in range(num_episodes):
             input(f"\n[record] Press Enter to start episode {episode_idx + 1}/{num_episodes}...")
             dataset.clear_episode_buffer()
-            print("[record] Recording —
+            print("[record] Recording — press Enter to save, D+Enter to discard")
+
+            while True:
+                with follower_lock:
+                    obs = follower_instance.get_observation()
+
+                state = np.array([
+                    obs["shoulder_pan.pos"],
+                    obs["shoulder_lift.pos"],
+                    obs["elbow_flex.pos"],
+                    obs["wrist_flex.pos"],
+                    obs["wrist_roll.pos"],
+                    obs["gripper.pos"],
+                ], dtype=np.float32)
+
+                with action_lock:
+                    act = latest_action
+
+                if act is not None:
+                    action_vec = np.array([
+                        act["shoulder_pan.pos"],
+                        act["shoulder_lift.pos"],
+                        act["elbow_flex.pos"],
+                        act["wrist_flex.pos"],
+                        act["wrist_roll.pos"],
+                        act["gripper.pos"],
+                    ], dtype=np.float32)
+                else:
                     action_vec = state.copy()
 
                 with frame_locks["webcam"]:
@@ -645,10 +946,11 @@ if __name__ == "__main__":
                         help=f"Start Foxglove WebSocket bridge on port {FOXGLOVE_PORT}")
     args = parser.parse_args()
 
-    threading.Thread(target=capture_webcam,    daemon=True).start()
+    #threading.Thread(target=capture_webcam,    daemon=True).start()
     threading.Thread(target=capture_realsense, daemon=True).start()
     threading.Thread(target=drive_loop,        daemon=True).start()
     threading.Thread(target=follower_loop,     daemon=True).start()
+    #threading.Thread(target=imu_loop,          daemon=True).start()
 
     if args.foxglove:
         threading.Thread(target=foxglove_bridge, daemon=True).start()

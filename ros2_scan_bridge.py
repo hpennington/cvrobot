@@ -2,18 +2,25 @@
 """
 ros2_scan_bridge.py
 -------------------
-Receives raw BGR + uint16 depth frames AND packed IMU data from
-jetson_combined.py over ZMQ and republishes them as ROS 2 topics for RTAB-Map.
+Receives raw BGR + uint16 depth frames from jetson_combined.py over ZMQ
+and republishes them as ROS 2 topics for RTAB-Map. Reads BNO08x IMU directly
+over I2C (no ZMQ hop) in a background thread.
 
 Publishes:
   /camera/color/image_raw        sensor_msgs/Image      (BGR8)
   /camera/color/camera_info      sensor_msgs/CameraInfo
   /camera/depth/image_rect_raw   sensor_msgs/Image      (16UC1, millimetres)
   /camera/depth/camera_info      sensor_msgs/CameraInfo
-  /imu/data                      sensor_msgs/Imu        (100 Hz, BNO08x)
+  /imu/data                      sensor_msgs/Imu        (IMU_HZ, BNO08x)
   /odom                          nav_msgs/Odometry      (identity + max covariance)
-  /tf                            static: odom→base_link, base_link→camera_link,
-                                          base_link→imu_link
+  /tf                            static: odom->base_link, base_link->camera_link,
+                                          base_link->imu_link
+
+RTAB-Map IMU integration (slam_launch.py):
+    rgbd_odometry remappings:  ('imu', '/imu/data')
+    rgbd_odometry params:      'Odom/GuessMotion': 'true'
+                               'Odom/GuessIMU':    'true'
+    rtabmap params:            'Optimizer/GravitySigma': '0.3'
 
 Run in a sourced ROS 2 terminal (system Python, not conda):
 
@@ -24,7 +31,7 @@ Run in a sourced ROS 2 terminal (system Python, not conda):
 
 import sys
 import time
-import struct
+import threading
 
 import cv2
 import numpy as np
@@ -54,7 +61,6 @@ except ImportError:
 JETSON_IP         = "127.0.0.1"
 RGB_BRIDGE_PORT   = 5559
 DEPTH_BRIDGE_PORT = 5560
-IMU_BRIDGE_PORT   = 5563
 
 # RealSense D415 intrinsics at 640×480 (colour stream)
 FX, FY = 601.023, 601.023
@@ -69,9 +75,13 @@ DOWNSAMPLE = 2
 # -90° around X then -90° around Z → qx=-0.5, qy=0.5, qz=-0.5, qw=0.5
 CAMERA_QX, CAMERA_QY, CAMERA_QZ, CAMERA_QW = -0.5, 0.5, -0.5, 0.5
 
+# ── IMU config ────────────────────────────────────────────────────────────────
+
+IMU_HZ       = 200    # BNO08x report rate — practical max ~400 Hz total over I2C
+IMU_I2C_ADDR = 0x4B   # default BNO08x address on Yahboom carrier
+
 # ── IMU extrinsic (base_link → imu_link) ─────────────────────────────────────
 # Translation: physical offset of IMU from base_link origin in metres.
-# Update XYZ to your actual measured offsets.
 IMU_TF_X, IMU_TF_Y, IMU_TF_Z = 0.0, 0.0, 0.05
 
 # Rotation: corrects for the BNO08x mounting orientation.
@@ -79,34 +89,16 @@ IMU_TF_X, IMU_TF_Y, IMU_TF_Z = 0.0, 0.0, 0.05
 # Measured with robot flat and stationary:
 #   raw accel  x≈+0.13  y≈+9.80  z≈-1.42
 #
-# This tells us:
-#   • IMU Y axis points DOWN  (y ≈ +9.8 ≈ +g)
-#   • IMU is tilted ~8.4° off horizontal  (arcsin(1.42/9.8))
-#   • Net rotation around IMU X axis: 90° + 8.4° = 98.4°
+# IMU Y axis points DOWN (y ≈ +g), tilted ~8.4° off horizontal.
+# Net rotation around IMU X axis: 90° + 8.4° = 98.4°
 #
-# Quaternion for pure X-axis rotation by 98.4°:
-#   qx = sin(98.4° / 2) = sin(49.2°) ≈ 0.757
-#   qw = cos(98.4° / 2) = cos(49.2°) ≈ 0.653
-#
-# With this TF, RTAB-Map receives gravity along +Z of base_link (ROS convention)
-# and gyro axes correctly mapped to the robot frame.
+# Quaternion: qx = sin(49.2°) ≈ 0.757, qw = cos(49.2°) ≈ 0.653
 IMU_QX, IMU_QY, IMU_QZ, IMU_QW = 0.757, 0.0, 0.0, 0.653
 
 CONNECT_TIMEOUT = 10.0   # warn if no camera frames within this many seconds
 
-# ── IMU wire format (must match jetson_combined.py) ───────────────────────────
-# 11 × float64 little-endian = 88 bytes
-#   [0]  timestamp  (time.time())
-#   [1-3]  accel x,y,z   m/s² raw (includes gravity)
-#   [4-6]  gyro  x,y,z   rad/s
-#   [7-10] quaternion i,j,k,real  (adafruit) → ROS x,y,z,w
-IMU_PACK_FMT  = "<11d"
-IMU_PACK_SIZE = struct.calcsize(IMU_PACK_FMT)
-
 # ── IMU covariance matrices ───────────────────────────────────────────────────
 # Row-major 3×3, diagonal = variance (stddev²).
-# BNO08x ARVR-stabilised rotation vector: ~1–2° RMS ≈ 0.017–0.035 rad stddev
-# Tune if RTAB-Map drift is excessive.
 ORIENTATION_COVARIANCE = [
     0.0012, 0.0,    0.0,
     0.0,    0.0012, 0.0,
@@ -117,12 +109,19 @@ ANGULAR_VELOCITY_COVARIANCE = [
     0.0,    0.0001, 0.0,
     0.0,    0.0,    0.0001,
 ]
-# Raw accel including gravity — RTAB-Map imu_topic expects this, not linear accel
+# Raw accel including gravity — RTAB-Map imu_topic expects this, not gravity-free
 LINEAR_ACCELERATION_COVARIANCE = [
     0.0025, 0.0,    0.0,
     0.0,    0.0025, 0.0,
     0.0,    0.0,    0.0025,
 ]
+
+# ── Odometry covariance ───────────────────────────────────────────────────────
+# Defined at module level to avoid the class-scope for-loop leaking _i into
+# the class namespace, which causes _ODOM_COV to silently fail as an attribute.
+_ODOM_COV = [0.0] * 36
+for _cov_i in (0, 7, 14):    _ODOM_COV[_cov_i] = 1.0   # position ~1m stddev
+for _cov_i in (21, 28, 35):  _ODOM_COV[_cov_i] = 1.0   # rotation ~57° stddev
 
 
 # ── ZMQ helpers ───────────────────────────────────────────────────────────────
@@ -130,8 +129,8 @@ LINEAR_ACCELERATION_COVARIANCE = [
 def make_sub_socket(ctx: zmq.Context, ip: str, port: int,
                     timeout_ms: int = 50) -> zmq.Socket:
     sock = ctx.socket(zmq.SUB)
-    sock.setsockopt(zmq.RCVHWM,   2)
-    sock.setsockopt(zmq.CONFLATE, 1)
+    sock.setsockopt(zmq.RCVHWM,   10)
+    sock.setsockopt(zmq.CONFLATE, 0)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
     sock.connect(f"tcp://{ip}:{port}")
     sock.setsockopt(zmq.SUBSCRIBE, b"")
@@ -204,34 +203,26 @@ def make_tf(stamp, parent, child,
 
 class RGBDBridgeNode(Node):
     """
-    Polls ZMQ for BGR frames, depth frames, and IMU packets;
-    republishes all three to ROS 2.
+    Polls ZMQ for BGR + depth frames and republishes to ROS 2.
+    Reads BNO08x directly over I2C in a daemon thread (_imu_loop).
 
-    TF tree published here:
-        odom (static identity, taken over by rgbd_odometry once tracking starts)
+    TF tree:
+        odom
           └─ base_link
-               ├─ camera_link   (fixed extrinsic — camera mount)
-               └─ imu_link      (fixed extrinsic — IMU mount, corrected for tilt)
+               ├─ camera_link
+               └─ imu_link
     """
-
-    _ODOM_COV = [0.0] * 36
-    for _i in (0, 7, 14):    _ODOM_COV[_i] = 1.0   # position ~1m stddev
-    for _i in (21, 28, 35):  _ODOM_COV[_i] = 1.0   # rotation ~57° stddev
 
     def __init__(self, zmq_ctx: zmq.Context):
         super().__init__("ros2_scan_bridge")
 
         # ── Static transforms ─────────────────────────────────────────────────
-        static_tf = tf2_ros.StaticTransformBroadcaster(self)
+        static_tf  = tf2_ros.StaticTransformBroadcaster(self)
         init_stamp = self.get_clock().now().to_msg()
         static_tf.sendTransform([
-            # odom → base_link: identity seed (rgbd_odometry takes over)
             make_tf(init_stamp, "odom",      "base_link"),
-            # base_link → camera_link: camera extrinsic
             make_tf(init_stamp, "base_link", "camera_link",
                     qx=CAMERA_QX, qy=CAMERA_QY, qz=CAMERA_QZ, qw=CAMERA_QW),
-            # base_link → imu_link: corrected for Y-down mounting + 8.4° tilt
-            # qx=0.757, qw=0.653 = 98.4° rotation around X axis
             make_tf(init_stamp, "base_link", "imu_link",
                     tx=IMU_TF_X, ty=IMU_TF_Y, tz=IMU_TF_Z,
                     qx=IMU_QX,   qy=IMU_QY,   qz=IMU_QZ,   qw=IMU_QW),
@@ -246,12 +237,9 @@ class RGBDBridgeNode(Node):
         self.odom_pub     = self.create_publisher(Odometry,   "/odom",                       10)
         self.tf_broad     = tf2_ros.TransformBroadcaster(self)
 
-        # ── ZMQ sockets ───────────────────────────────────────────────────────
+        # ── ZMQ sockets (camera only — no IMU socket) ─────────────────────────
         self.rgb_sub = make_sub_socket(zmq_ctx, JETSON_IP, RGB_BRIDGE_PORT)
         self.dep_sub = make_sub_socket(zmq_ctx, JETSON_IP, DEPTH_BRIDGE_PORT)
-        # IMU: timeout_ms=1 (near non-blocking) — drain queue each spin
-        # without holding up camera frames.
-        self.imu_sub = make_sub_socket(zmq_ctx, JETSON_IP, IMU_BRIDGE_PORT, timeout_ms=1)
 
         # Intrinsics scaled for the published resolution
         s = 1.0 / max(1, DOWNSAMPLE)
@@ -261,80 +249,155 @@ class RGBDBridgeNode(Node):
         self._frames     = 0
         self._imu_frames = 0
         self._t_warn     = time.monotonic()
+        self._running    = True
+
+        # ── IMU thread ────────────────────────────────────────────────────────
+        self._imu_thread = threading.Thread(
+            target=self._imu_loop, daemon=True, name="imu_loop"
+        )
+        self._imu_thread.start()
 
         self.get_logger().info(
             f"Bridge ready — rgb:{RGB_BRIDGE_PORT} depth:{DEPTH_BRIDGE_PORT} "
-            f"imu:{IMU_BRIDGE_PORT} downsample:{DOWNSAMPLE}x\n"
+            f"imu:direct@{IMU_HZ}Hz downsample:{DOWNSAMPLE}x\n"
             f"IMU TF: pos=({IMU_TF_X}, {IMU_TF_Y}, {IMU_TF_Z}) "
             f"quat=({IMU_QX:.3f}, {IMU_QY:.3f}, {IMU_QZ:.3f}, {IMU_QW:.3f})"
         )
 
-    # ── IMU ───────────────────────────────────────────────────────────────────
+    # ── IMU thread ────────────────────────────────────────────────────────────
 
-    def _publish_imu(self) -> None:
+    def _imu_loop(self) -> None:
         """
-        Drain the latest IMU packet from ZMQ and publish it.
-        CONFLATE=1 on the ZMQ socket keeps only the newest packet, so we get
-        one per poll at ~30 Hz. This is fine for RTAB-Map; remove CONFLATE
-        and raise RCVHWM if you need every 100 Hz sample for an EKF.
+        Read BNO08x directly over I2C and publish to /imu/data at IMU_HZ.
+
+        Runs as a daemon thread independent of the camera spin loop so the
+        IMU rate is not coupled to camera frame rate. Reconnects automatically
+        on I2C errors.
+
+        adafruit-blinka maps board.SCL/SDA → I2C bus 7 on the Yahboom carrier.
+        Install deps:  pip install adafruit-circuitpython-bno08x
         """
         try:
-            raw = self.imu_sub.recv()
-        except zmq.Again:
-            return
-        except Exception as e:
-            self.get_logger().warn(f"IMU ZMQ error: {e}", throttle_duration_sec=2.0)
-            return
-
-        if len(raw) != IMU_PACK_SIZE:
-            self.get_logger().warn(
-                f"Bad IMU packet: {len(raw)}B (expected {IMU_PACK_SIZE}B)",
-                throttle_duration_sec=5.0,
+            import board
+            import busio
+            from adafruit_bno08x.i2c import BNO08X_I2C
+            from adafruit_bno08x import (
+                BNO_REPORT_ACCELEROMETER,
+                BNO_REPORT_GYROSCOPE,
+                BNO_REPORT_ROTATION_VECTOR,
+            )
+        except ImportError as e:
+            self.get_logger().error(
+                f"IMU dependencies missing: {e}\n"
+                "Install with: pip install adafruit-circuitpython-bno08x"
             )
             return
 
-        (_, ax, ay, az, gx, gy, gz, qi, qj, qk, qr) = struct.unpack(IMU_PACK_FMT, raw)
+        interval_us = int(1e6 / IMU_HZ)   # microseconds per report
+        period      = 1.0 / IMU_HZ        # seconds per publish cycle
+        reconnect_delay = 3.0
 
-        msg = Imu()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = "imu_link"
+        # Raise this thread's OS priority so it isn't starved by the camera
+        # spin loop or ROS executor threads. SCHED_FIFO requires root or
+        # CAP_SYS_NICE; falls back silently if not available.
+        try:
+            import os as _os
+            param = _os.sched_param(_os.sched_get_priority_max(_os.SCHED_FIFO) - 1)
+            _os.sched_setscheduler(0, _os.SCHED_FIFO, param)
+            self.get_logger().info("IMU thread: SCHED_FIFO priority set")
+        except Exception:
+            pass   # non-root — proceed with default scheduling
 
-        # Quaternion: adafruit order (i, j, k, real) → ROS order (x, y, z, w)
-        msg.orientation.x = qi
-        msg.orientation.y = qj
-        msg.orientation.z = qk
-        msg.orientation.w = qr
-        msg.orientation_covariance = ORIENTATION_COVARIANCE
+        while self._running:
+            try:
+                i2c = busio.I2C(board.SCL, board.SDA)
+                bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR)
 
-        msg.angular_velocity.x = gx
-        msg.angular_velocity.y = gy
-        msg.angular_velocity.z = gz
-        msg.angular_velocity_covariance = ANGULAR_VELOCITY_COVARIANCE
+                bno.enable_feature(BNO_REPORT_GYROSCOPE,       interval_us)
+                bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, interval_us)
 
-        # Raw accel including gravity — RTAB-Map expects this (not gravity-free)
-        msg.linear_acceleration.x = ax
-        msg.linear_acceleration.y = ay
-        msg.linear_acceleration.z = az
-        msg.linear_acceleration_covariance = LINEAR_ACCELERATION_COVARIANCE
+                self.get_logger().info(
+                    f"BNO08x ready at 0x{IMU_I2C_ADDR:02X}, {IMU_HZ} Hz"
+                )
 
-        self.imu_pub.publish(msg)
-        self._imu_frames += 1
+                # Absolute deadline loop — tracks cumulative drift instead of
+                # sleeping relative to each iteration end time. This keeps the
+                # IMU publish rate accurate even when I2C reads take variable
+                # time, and ensures IMU stamps stay ahead of camera stamps so
+                # rgbd_odometry never drops frames waiting for IMU.
+                next_deadline = time.monotonic()
 
-        if self._imu_frames == 1:
-            self.get_logger().info("First IMU sample received — /imu/data publishing")
+                while self._running:
+                    gyro  = bno.gyro           # (gx, gy, gz) rad/s
+                    quat  = bno.quaternion     # (i, j, k, w) — adafruit order
 
-    # ── Odometry + dynamic TF ─────────────────────────────────────────────────
+                    if gyro is None or quat is None:
+                        next_deadline += period
+                        sleep_t = next_deadline - time.monotonic()
+                        if sleep_t > 0:
+                            time.sleep(sleep_t)
+                        continue
+
+                    msg = Imu()
+                    msg.header.stamp    = self.get_clock().now().to_msg()
+                    msg.header.frame_id = "imu_link"
+
+                    # adafruit (i, j, k, real) → ROS (x, y, z, w)
+                    msg.orientation.x = quat[0]
+                    msg.orientation.y = quat[1]
+                    msg.orientation.z = quat[2]
+                    msg.orientation.w = quat[3]
+                    msg.orientation_covariance = ORIENTATION_COVARIANCE
+
+                    msg.angular_velocity.x = gyro[0]
+                    msg.angular_velocity.y = gyro[1]
+                    msg.angular_velocity.z = gyro[2]
+                    msg.angular_velocity_covariance = ANGULAR_VELOCITY_COVARIANCE
+
+                    # Raw accel including gravity — RTAB-Map expects this
+                    msg.linear_acceleration.x = 0.0
+                    msg.linear_acceleration.y = 0.0 
+                    msg.linear_acceleration.z = 0.0 
+                    msg.linear_acceleration_covariance = [
+                        9999.0, 0.0,    0.0,
+                        0.0,    9999.0, 0.0,
+                        0.0,    0.0,    9999.0, 
+                    ]
+
+                    self.imu_pub.publish(msg)
+                    self._imu_frames += 1
+
+                    if self._imu_frames == 1:
+                        self.get_logger().info("First IMU sample — /imu/data publishing")
+
+                    # Advance deadline and sleep only the remainder.
+                    # If already past deadline (slow I2C), skip sleep and catch
+                    # up next iteration. If >1 period behind, reset to avoid a
+                    # burst of back-to-back publishes after a stall.
+                    next_deadline += period
+                    sleep_t = next_deadline - time.monotonic()
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+                    elif sleep_t < -period:
+                        next_deadline = time.monotonic()
+
+            except Exception as e:
+                self.get_logger().warn(
+                    f"IMU error: {e} — reconnecting in {reconnect_delay}s",
+                    throttle_duration_sec=5.0,
+                )
+                time.sleep(reconnect_delay)
+
+    # ── Odometry ──────────────────────────────────────────────────────────────
 
     def _publish_odom(self, stamp) -> None:
-        # Stub /odom so rtabmap's approx_sync has something to pair with
-        # camera frames before rgbd_odometry starts publishing real odometry.
         odom = Odometry()
         odom.header.stamp    = stamp
         odom.header.frame_id = "odom"
         odom.child_frame_id  = "base_link"
         odom.pose.pose.orientation.w = 1.0
-        odom.pose.covariance  = list(self._ODOM_COV)
-        odom.twist.covariance = list(self._ODOM_COV)
+        odom.pose.covariance  = list(_ODOM_COV)
+        odom.twist.covariance = list(_ODOM_COV)
         self.odom_pub.publish(odom)
 
     # ── Camera ────────────────────────────────────────────────────────────────
@@ -343,8 +406,6 @@ class RGBDBridgeNode(Node):
         rgb = recv_frame(self.rgb_sub)
         dep = recv_frame(self.dep_sub)
 
-        # Single clock call — identical stamp for RGB and depth so
-        # rgbd_odometry's approx_sync pairs them with zero interval.
         stamp = self.get_clock().now().to_msg()
 
         if rgb is not None:
@@ -379,7 +440,6 @@ class RGBDBridgeNode(Node):
 
     def spin_once(self) -> None:
         stamp = self.get_clock().now().to_msg()
-        self._publish_imu()        # drain IMU queue first (fastest source)
         self._publish_odom(stamp)
         self._publish_cameras()
 
@@ -392,14 +452,14 @@ class RGBDBridgeNode(Node):
 
         if self._imu_frames == 0 and (now - self._t_warn) > CONNECT_TIMEOUT:
             self.get_logger().warn(
-                "No IMU frames received — is BNO08x wired and adafruit_bno08x installed?"
+                "No IMU frames — check BNO08x wiring and adafruit-circuitpython-bno08x install"
             )
             self._t_warn = now
 
     def destroy(self) -> None:
+        self._running = False
         self.rgb_sub.close()
         self.dep_sub.close()
-        self.imu_sub.close()
         super().destroy_node()
 
 
@@ -425,3 +485,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
