@@ -77,7 +77,7 @@ CAMERA_QX, CAMERA_QY, CAMERA_QZ, CAMERA_QW = -0.5, 0.5, -0.5, 0.5
 
 # ── IMU config ────────────────────────────────────────────────────────────────
 
-IMU_HZ       = 200    # BNO08x report rate — practical max ~400 Hz total over I2C
+IMU_HZ       = 400    # BNO08x report rate — practical max ~400 Hz total over I2C
 IMU_I2C_ADDR = 0x4B   # default BNO08x address on Yahboom carrier
 
 # ── IMU extrinsic (base_link → imu_link) ─────────────────────────────────────
@@ -267,22 +267,11 @@ class RGBDBridgeNode(Node):
     # ── IMU thread ────────────────────────────────────────────────────────────
 
     def _imu_loop(self) -> None:
-        """
-        Read BNO08x directly over I2C and publish to /imu/data at IMU_HZ.
-
-        Runs as a daemon thread independent of the camera spin loop so the
-        IMU rate is not coupled to camera frame rate. Reconnects automatically
-        on I2C errors.
-
-        adafruit-blinka maps board.SCL/SDA → I2C bus 7 on the Yahboom carrier.
-        Install deps:  pip install adafruit-circuitpython-bno08x
-        """
         try:
             import board
             import busio
             from adafruit_bno08x.i2c import BNO08X_I2C
             from adafruit_bno08x import (
-                BNO_REPORT_ACCELEROMETER,
                 BNO_REPORT_GYROSCOPE,
                 BNO_REPORT_ROTATION_VECTOR,
             )
@@ -293,100 +282,101 @@ class RGBDBridgeNode(Node):
             )
             return
 
-        interval_us = int(1e6 / IMU_HZ)   # microseconds per report
-        period      = 1.0 / IMU_HZ        # seconds per publish cycle
+        interval_us     = 1_000_000
+        period          = 1.0 / IMU_HZ
         reconnect_delay = 3.0
 
-        # Raise this thread's OS priority so it isn't starved by the camera
-        # spin loop or ROS executor threads. SCHED_FIFO requires root or
-        # CAP_SYS_NICE; falls back silently if not available.
         try:
             import os as _os
             param = _os.sched_param(_os.sched_get_priority_max(_os.SCHED_FIFO) - 1)
             _os.sched_setscheduler(0, _os.SCHED_FIFO, param)
             self.get_logger().info("IMU thread: SCHED_FIFO priority set")
         except Exception:
-            pass   # non-root — proceed with default scheduling
+            pass
+
+        # ── Pre-allocate message — reuse every iteration ──────────────────
+        msg = Imu()
+        msg.header.frame_id = "imu_link"
+        msg.orientation_covariance        = ORIENTATION_COVARIANCE
+        msg.angular_velocity_covariance   = ANGULAR_VELOCITY_COVARIANCE
+        msg.linear_acceleration.x         = 0.0
+        msg.linear_acceleration.y         = 0.0
+        msg.linear_acceleration.z         = 0.0
+        msg.linear_acceleration_covariance = [
+            9999.0, 0.0, 0.0,  0.0, 9999.0, 0.0,  0.0, 0.0, 9999.0,
+        ]
+
+        # ── Cache attribute lookups to locals ─────────────────────────────
+        stamp   = msg.header.stamp
+        orient  = msg.orientation
+        ang_vel = msg.angular_velocity
+        publish = self.imu_pub.publish
+        log     = self.get_logger()
+        _time_ns   = time.time_ns
+        _monotonic = time.monotonic
+        _sleep     = time.sleep
+        _NS        = 1_000_000_000
 
         while self._running:
             try:
-                i2c = busio.I2C(board.SCL, board.SDA)
+                i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
                 bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR)
 
                 bno.enable_feature(BNO_REPORT_GYROSCOPE,       interval_us)
                 bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, interval_us)
 
-                self.get_logger().info(
-                    f"BNO08x ready at 0x{IMU_I2C_ADDR:02X}, {IMU_HZ} Hz"
-                )
+                log.info(f"BNO08x ready at 0x{IMU_I2C_ADDR:02X}, {IMU_HZ} Hz")
 
-                # Absolute deadline loop — tracks cumulative drift instead of
-                # sleeping relative to each iteration end time. This keeps the
-                # IMU publish rate accurate even when I2C reads take variable
-                # time, and ensures IMU stamps stay ahead of camera stamps so
-                # rgbd_odometry never drops frames waiting for IMU.
-                next_deadline = time.monotonic()
+                next_deadline = _monotonic()
+                count = 0
 
                 while self._running:
-                    gyro  = bno.gyro           # (gx, gy, gz) rad/s
-                    quat  = bno.quaternion     # (i, j, k, w) — adafruit order
+                    gyro = bno.gyro                
+                    quat = bno.quaternion 
 
                     if gyro is None or quat is None:
                         next_deadline += period
-                        sleep_t = next_deadline - time.monotonic()
-                        if sleep_t > 0:
-                            time.sleep(sleep_t)
+                        rem = next_deadline - _monotonic()
+                        if rem > 0:
+                            _sleep(rem)
                         continue
 
-                    msg = Imu()
-                    msg.header.stamp    = self.get_clock().now().to_msg()
-                    msg.header.frame_id = "imu_link"
+                    # Direct timestamp — avoids get_clock().now().to_msg()
+                    # object chain (Time + builtin_interfaces.msg.Time allocs)
+                    t_ns          = _time_ns()
+                    stamp.sec     = t_ns // _NS
+                    stamp.nanosec = t_ns % _NS
 
-                    # adafruit (i, j, k, real) → ROS (x, y, z, w)
-                    msg.orientation.x = quat[0]
-                    msg.orientation.y = quat[1]
-                    msg.orientation.z = quat[2]
-                    msg.orientation.w = quat[3]
-                    msg.orientation_covariance = ORIENTATION_COVARIANCE
+                    orient.x  = quat[0]
+                    orient.y  = quat[1]
+                    orient.z  = quat[2]
+                    orient.w  = quat[3]
 
-                    msg.angular_velocity.x = gyro[0]
-                    msg.angular_velocity.y = gyro[1]
-                    msg.angular_velocity.z = gyro[2]
-                    msg.angular_velocity_covariance = ANGULAR_VELOCITY_COVARIANCE
+                    ang_vel.x = gyro[0]
+                    ang_vel.y = gyro[1]
+                    ang_vel.z = gyro[2]
 
-                    # Raw accel including gravity — RTAB-Map expects this
-                    msg.linear_acceleration.x = 0.0
-                    msg.linear_acceleration.y = 0.0 
-                    msg.linear_acceleration.z = 0.0 
-                    msg.linear_acceleration_covariance = [
-                        9999.0, 0.0,    0.0,
-                        0.0,    9999.0, 0.0,
-                        0.0,    0.0,    9999.0, 
-                    ]
+                    publish(msg)
+                    count += 1
 
-                    self.imu_pub.publish(msg)
-                    self._imu_frames += 1
+                    if count == 1:
+                        log.info("First IMU sample — /imu/data publishing")
 
-                    if self._imu_frames == 1:
-                        self.get_logger().info("First IMU sample — /imu/data publishing")
+                    self._imu_frames = count
 
-                    # Advance deadline and sleep only the remainder.
-                    # If already past deadline (slow I2C), skip sleep and catch
-                    # up next iteration. If >1 period behind, reset to avoid a
-                    # burst of back-to-back publishes after a stall.
                     next_deadline += period
-                    sleep_t = next_deadline - time.monotonic()
-                    if sleep_t > 0:
-                        time.sleep(sleep_t)
-                    elif sleep_t < -period:
-                        next_deadline = time.monotonic()
+                    rem = next_deadline - _monotonic()
+                    if rem > 0:
+                        _sleep(rem)
+                    elif rem < -period:
+                        next_deadline = _monotonic()
 
             except Exception as e:
-                self.get_logger().warn(
+                log.warn(
                     f"IMU error: {e} — reconnecting in {reconnect_delay}s",
                     throttle_duration_sec=5.0,
                 )
-                time.sleep(reconnect_delay)
+                _sleep(reconnect_delay)
 
     # ── Odometry ──────────────────────────────────────────────────────────────
 
