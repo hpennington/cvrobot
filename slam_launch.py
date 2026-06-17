@@ -19,7 +19,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-BRIDGE_SCRIPT = os.path.expanduser("~/ros2_ws/ros2_scan_bridge.py")
+BRIDGE_SCRIPT = os.path.expanduser("~/cvrobot/ros2_scan_bridge.py")
 
 RTABMAP_PARAMS = {
     "frame_id":    "base_link",
@@ -37,6 +37,10 @@ RTABMAP_PARAMS = {
 
     # ── Planar (2-D) motion constraint ────────────────────────────────────────
     "Reg/Force3DoF":          "true",
+    "Reg/Strategy": "2",
+    "Icp/PointToPlane":  "true",
+    "Icp/VoxelSize":     "0.05",
+    "Icp/MaxCorrespondenceDistance": "0.1",
     # Re-enabled: BNO08x gravity provides yaw-drift anchor during fast rotation.
     # Was "0" (disabled) before — that caused pose graph inconsistency after spins.
     "Optimizer/GravitySigma": "0.3",
@@ -76,6 +80,9 @@ RTABMAP_PARAMS = {
     "Vis/MinInliers":     "12",
     # PnP (3D→2D) is more robust than 3D→3D under fast motion
     "Vis/EstimationType": "1",
+    "Vis/MinDepth":    "0.5",
+    "Vis/MaxDepth":    "4.0",
+    "Vis/DepthAsMask": "true",   # keep default — reject features without depth
 }
 
 RGBD_ODOM_PARAMS = {

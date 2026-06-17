@@ -80,7 +80,7 @@ ros2 launch slam_launch.py
 #### Terminal 4
 
 ```bash
-source /opt/ros/jazzy/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8766
+source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8766
 ```
 
 ### My Bluetooth joystick address

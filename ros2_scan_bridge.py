@@ -282,7 +282,7 @@ class RGBDBridgeNode(Node):
             )
             return
 
-        interval_us     = 1_000_000
+        interval_us     = 100_000
         period          = 1.0 / IMU_HZ
         reconnect_delay = 3.0
 
@@ -320,7 +320,7 @@ class RGBDBridgeNode(Node):
         while self._running:
             try:
                 i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
-                bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR)
+                bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR, probe=False)
 
                 bno.enable_feature(BNO_REPORT_GYROSCOPE,       interval_us)
                 bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, interval_us)
