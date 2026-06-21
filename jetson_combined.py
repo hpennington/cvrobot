@@ -1,7 +1,9 @@
 """
 jetson_combined.py
 ------------------
-- Streams webcam (index 0) and RealSense over ZMQ (ports 5556, 5557)
+- Streams webcam over ZMQ (port 5556); RealSense color/depth come from the
+  realsense2_camera ROS2 node (slam_launch.py) via a ROS2 subscription —
+  this script no longer owns the RealSense USB device directly
 - Reads gamepad and sends differential drive commands to Arduino over serial
 - Follower arm mirrors leader arm always
 - Records LeRobot episodes with follower arm + cameras
@@ -31,8 +33,11 @@ import serial
 
 import cv2
 import zmq
-import pyrealsense2 as rs
 import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image as RosImage
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -58,10 +63,17 @@ QUALITY         = 50
 WEBCAM_PORT     = 5556
 REALSENSE_PORT  = 5557
 
-# RTAB-Map / ZMQ bridge ports
-RGB_BRIDGE_PORT   = 5559  # raw BGR image bytes → ros2_scan_bridge.py
-DEPTH_BRIDGE_PORT = 5560  # raw uint16 depth bytes → ros2_scan_bridge.py
-IMU_BRIDGE_PORT   = 5563  # JSON accel/gyro/quat → ros2_scan_bridge.py
+# realsense2_camera (launched by slam_launch.py) owns the RealSense device and
+# publishes color/depth directly to ROS2 for RTAB-Map — this script no longer
+# forwards raw frames over ZMQ. See ROS_COLOR_TOPIC/ROS_DEPTH_TOPIC below.
+IMU_BRIDGE_PORT   = 5563  # JSON accel/gyro/quat → ros2_scan_bridge.py (legacy path, unused — imu_loop thread disabled)
+
+# Topics published by realsense2_camera (slam_launch.py) — subscribed here to
+# refill latest_frames for Foxglove preview / LeRobot recording. Nested under
+# /camera/camera/... because camera_namespace falls back to camera_name on
+# this realsense-ros version regardless of override — see slam_launch.py.
+ROS_COLOR_TOPIC = "/camera/camera/color/image_raw"
+ROS_DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 
 FOLLOWER_PORT        = "/dev/ttyACM1"
 FOLLOWER_ID          = "my_awesome_follower_arm"
@@ -79,8 +91,8 @@ MAX_WHEEL_SPEED = 6.28    # rad/s at full command (|cmd| == 1.0) — tune to you
 # ── Foxglove WebSocket bridge ─────────────────────────────────────────────────
 
 FOXGLOVE_PORT    = 8765
-FOXGLOVE_HZ_CAM  = 15
-FOXGLOVE_HZ_SLOW = 10
+FOXGLOVE_HZ_CAM  = 30
+FOXGLOVE_HZ_SLOW = 30
 
 # ── IMU (BNO08x over I2C) ────────────────────────────────────────────────────
 
@@ -134,19 +146,6 @@ def capture_webcam():
             sock.send(buf.tobytes())
     cap.release()
 
-def _rs_hardware_reset():
-    """Issue a USB hardware reset to all connected RealSense devices."""
-    try:
-        ctx = rs.context()
-        for dev in ctx.query_devices():
-            serial = dev.get_info(rs.camera_info.serial_number)
-            print(f"[realsense] hardware reset → {serial}")
-            dev.hardware_reset()
-        time.sleep(2.0)  # device needs time to re-enumerate on USB
-    except Exception as e:
-        print(f"[realsense] hardware reset failed: {e}")
-
-
 def _disable_usb_autosuspend():
     """Disable USB autosuspend to prevent the kernel from powering down the camera."""
     try:
@@ -159,104 +158,69 @@ def _disable_usb_autosuspend():
         print(f"[realsense] could not disable USB autosuspend: {e}")
 
 
+class _RealsenseSubscriber(Node):
+    """
+    Subscribes to realsense2_camera's color + aligned-depth topics (published
+    by the realsense2_camera node started in slam_launch.py, which now owns
+    the RealSense USB device directly) and refills latest_frames so
+    realsense_jpeg_publisher() and LeRobot recording keep working unchanged.
+    """
+
+    def __init__(self):
+        super().__init__("jetson_combined_realsense_sub")
+        self.create_subscription(RosImage, ROS_COLOR_TOPIC, self._on_color, 10)
+        self.create_subscription(RosImage, ROS_DEPTH_TOPIC, self._on_depth, 10)
+
+    def _on_color(self, msg: RosImage) -> None:
+        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        if msg.encoding == "rgb8":
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        with frame_locks["realsense"]:
+            latest_frames["realsense"] = img.copy()
+
+    def _on_depth(self, msg: RosImage) -> None:
+        d_arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+        with frame_locks["depth"]:
+            latest_frames["depth"] = d_arr.copy()
+
+
 def capture_realsense():
     """
-    Capture loop with depth alignment and automatic reconnection.
-
-    Publishes:
-      - JPEG colour on REALSENSE_PORT (Foxglove / recording)
-      - Raw BGR + depth on RGB_BRIDGE_PORT / DEPTH_BRIDGE_PORT (ros2_scan_bridge → RTAB-Map)
-
-    Uses try_wait_for_frames (non-throwing) instead of wait_for_frames to avoid
-    hanging on USB stalls.  Issues a hardware reset before each reconnect attempt.
+    Runs the ROS2 subscriber that mirrors realsense2_camera's color/depth
+    topics into latest_frames, on its own rclpy executor thread.
     """
     _disable_usb_autosuspend()
 
-    sock       = make_pub(REALSENSE_PORT)
-    rgb_sock   = make_pub(RGB_BRIDGE_PORT)
-    depth_sock = make_pub(DEPTH_BRIDGE_PORT)
-
-    TIMEOUT_MS       = 2000
-    CONSECUTIVE_MAX  = 5
-    STALE_TIMEOUT    = 5.0    # seconds with no new frames → force reconnect
-    RECONNECT_DELAY  = 3.0
-
-    while not stop_event.is_set():
-        pipeline = None
-        try:
-            pipeline = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-            pipeline.start(cfg)
-            #align = rs.align(rs.stream.color)
-            print("[realsense] started (colour + depth)")
-            consecutive_timeouts = 0
-            last_good_frame = time.monotonic()
-
-            while not stop_event.is_set():
-                # Non-throwing: returns (success, frameset) instead of
-                # hanging indefinitely on USB stalls.
-                success, raw_frames = pipeline.try_wait_for_frames(TIMEOUT_MS)
-
-                if not success:
-                    consecutive_timeouts += 1
-                    print(f"[realsense] frame timeout #{consecutive_timeouts}")
-                    if consecutive_timeouts >= CONSECUTIVE_MAX:
-                        print("[realsense] too many timeouts — reconnecting")
-                        break
-                    continue
-
-                # Staleness check: if we got a frameset but haven't had a
-                # usable colour frame in STALE_TIMEOUT seconds, force restart.
-                consecutive_timeouts = 0
-
-                #frames = align.process(raw_frames)
-                frames = raw_frames
-                color  = frames.get_color_frame()
-                depth  = frames.get_depth_frame()
-                if not color:
-                    if (time.monotonic() - last_good_frame) > STALE_TIMEOUT:
-                        print("[realsense] no colour frames — stale, reconnecting")
-                        break
-                    continue
-
-                last_good_frame = time.monotonic()
-                img = np.asanyarray(color.get_data())
-
-                with frame_locks["realsense"]:
-                    latest_frames["realsense"] = img.copy()
-                if depth:
-                    with frame_locks["depth"]:
-                        latest_frames["depth"] = np.asanyarray(depth.get_data()).copy()
-
-                # JPEG for Foxglove / recording
-                _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
-                sock.send(buf.tobytes())
-
-                # Raw frames for ros2_scan_bridge → RTAB-Map
-                h, w = img.shape[:2]
-                rgb_sock.send(np.array([h, w], dtype=np.int32).tobytes() + img.tobytes())
-                if depth:
-                    d_arr = np.asanyarray(depth.get_data())
-                    depth_sock.send(np.array([*d_arr.shape], dtype=np.int32).tobytes() + d_arr.tobytes())
-
-        except Exception as e:
-            print(f"[realsense] error: {e}")
-        finally:
-            if pipeline is not None:
-                try:
-                    pipeline.stop()
-                except Exception:
-                    pass
-            print("[realsense] pipeline stopped")
-
-        if not stop_event.is_set():
-            print(f"[realsense] hardware reset + reconnect in {RECONNECT_DELAY}s…")
-            _rs_hardware_reset()
-            time.sleep(RECONNECT_DELAY)
+    rclpy.init(args=None)
+    node = _RealsenseSubscriber()
+    try:
+        while not stop_event.is_set():
+            rclpy.spin_once(node, timeout_sec=0.5)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
     print("[realsense] thread exiting")
+
+
+def realsense_jpeg_publisher(hz: float = 15.0):
+    """
+    Serves the legacy JPEG colour stream (camera_sub.py) on REALSENSE_PORT.
+    Runs on its own thread, reading from the latest_frames cache, so a slow
+    JPEG encode/send never throttles capture_realsense's RTAB-Map frame rate.
+    """
+    sock     = make_pub(REALSENSE_PORT)
+    interval = 1.0 / hz
+    while not stop_event.is_set():
+        t0 = time.monotonic()
+        with frame_locks["realsense"]:
+            img = latest_frames["realsense"]
+        if img is not None:
+            _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
+            sock.send(buf.tobytes())
+        elapsed = time.monotonic() - t0
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
 
 # ── Serial helpers ────────────────────────────────────────────────────────────
 
@@ -946,10 +910,11 @@ if __name__ == "__main__":
                         help=f"Start Foxglove WebSocket bridge on port {FOXGLOVE_PORT}")
     args = parser.parse_args()
 
-    #threading.Thread(target=capture_webcam,    daemon=True).start()
-    threading.Thread(target=capture_realsense, daemon=True).start()
-    threading.Thread(target=drive_loop,        daemon=True).start()
-    threading.Thread(target=follower_loop,     daemon=True).start()
+    #threading.Thread(target=capture_webcam,        daemon=True).start()
+    # threading.Thread(target=capture_realsense,       daemon=True).start()
+    # threading.Thread(target=realsense_jpeg_publisher, daemon=True).start()
+    threading.Thread(target=drive_loop,              daemon=True).start()
+    # threading.Thread(target=follower_loop,     daemon=True).start()
     #threading.Thread(target=imu_loop,          daemon=True).start()
 
     if args.foxglove:

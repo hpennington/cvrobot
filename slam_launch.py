@@ -55,7 +55,7 @@ RTABMAP_PARAMS = {
     "Rtabmap/StartNewMapOnLoopClosure": "true",
 
     # Allow more submaps to be retrieved for relocalization after a spin
-    "Rtabmap/MaxRetrieved": "2",
+    "Rtabmap/MaxRetrieved": "4",
 
     # Slightly more permissive loop closure threshold (default 0.15)
     "Rtabmap/LoopThr": "0.11",
@@ -74,15 +74,18 @@ RTABMAP_PARAMS = {
     # FIX: ORB (type 2) is rotation-invariant; original GFTT/Harris are not.
     # This is the single highest-impact change for fast rotation robustness.
     "Vis/FeatureType":    "2",    # ORB
-    "Vis/MaxFeatures":    "600",
+    "Vis/MaxFeatures":    "3000",
     # Slightly more permissive than default (20), but higher than before (10)
     # to avoid accepting frames with too few inliers into the map
     "Vis/MinInliers":     "12",
     # PnP (3D→2D) is more robust than 3D→3D under fast motion
     "Vis/EstimationType": "1",
-    "Vis/MinDepth":    "0.5",
+    "Vis/MinDepth":    "0.25",
     "Vis/MaxDepth":    "4.0",
     "Vis/DepthAsMask": "true",   # keep default — reject features without depth
+    # "Stereo/OpticalFlow": "true",
+    # "Vis/CorType": "1",
+    "approx_sync_max_interval": 0.1,
 }
 
 RGBD_ODOM_PARAMS = {
@@ -114,7 +117,7 @@ RGBD_ODOM_PARAMS = {
     # FIX: ORB replaces GFTT — rotation-invariant by design.
     # GFTT/QualityLevel and GFTT/MinDistance are removed (irrelevant for ORB).
     "Vis/FeatureType": "2",    # ORB
-    "Vis/MaxFeatures": "600",
+    "Vis/MaxFeatures": "500",
     "Vis/MinInliers":  "12",
 
     # Larger feature map window → better recall when revisiting after a spin
@@ -122,7 +125,43 @@ RGBD_ODOM_PARAMS = {
 
     # Visual odometry only (not ICP — ICP needs dense lidar geometry)
     "Reg/Strategy": "0",
+    "Vis/ImageDecimation": "1",
+    # "Stereo/OpticalFlow": "true",
+    # "Odom/Strategy": "1",
+    "approx_sync_max_interval": 0.1,
 }
+
+# realsense2_camera publishes color/depth directly (replaces the old
+# ros2_scan_bridge ZMQ image forwarding, which was capped at ~14fps by
+# per-frame Python message construction). align_depth makes the depth
+# topic match the color stream's resolution/intrinsics, as rgbd_odometry
+# and rtabmap require.
+#
+# NOTE: confirm these exact topic names with `ros2 topic list` against the
+# installed realsense-ros version before relying on them — naming
+# conventions (e.g. /camera/color/... vs /camera/camera/color/...) have
+# changed across releases.
+REALSENSE_PARAMS = {
+    "camera_name":          "camera",
+    "enable_color":         True,
+    "rgb_camera.profile":   "640x480x30",
+    "enable_depth":         True,
+    "depth_module.profile": "640x480x30",
+    "align_depth.enable":   True,
+    "publish_tf":           True,
+    # "exposure": "5000",
+    # "enable_auto_exposure": False,
+    "approx_sync_max_interval": 0.1,
+}
+
+# camera_namespace overrides (even explicit "") don't take effect on this
+# realsense-ros version — it nests topics under /camera/camera/... (camera_
+# namespace falls back to camera_name) regardless. Confirmed via
+# `ros2 topic hz` against the node's actual output rather than fighting it.
+REALSENSE_RGB_TOPIC    = "/camera/camera/color/image_raw"
+REALSENSE_RGB_INFO     = "/camera/camera/color/camera_info"
+REALSENSE_DEPTH_TOPIC  = "/camera/camera/aligned_depth_to_color/image_raw"
+
 
 def generate_launch_description():
     fresh_arg = DeclareLaunchArgument(
@@ -136,6 +175,14 @@ def generate_launch_description():
         output="screen",
     )
 
+    realsense = Node(
+        package="realsense2_camera",
+        executable="realsense2_camera_node",
+        name="camera",
+        output="screen",
+        parameters=[REALSENSE_PARAMS],
+    )
+
     rtabmap = TimerAction(
         period=2.0,
         actions=[
@@ -147,9 +194,9 @@ def generate_launch_description():
                 output="screen",
                 parameters=[RTABMAP_PARAMS],
                 remappings=[
-                    ("rgb/image",       "/camera/color/image_raw"),
-                    ("rgb/camera_info", "/camera/color/camera_info"),
-                    ("depth/image",     "/camera/depth/image_rect_raw"),
+                    ("rgb/image",       REALSENSE_RGB_TOPIC),
+                    ("rgb/camera_info", REALSENSE_RGB_INFO),
+                    ("depth/image",     REALSENSE_DEPTH_TOPIC),
                     ("odom",            "/rtabmap/odom"),
                 ],
                 arguments=["--delete_db_on_start"],
@@ -162,15 +209,14 @@ def generate_launch_description():
                 output="screen",
                 parameters=[RGBD_ODOM_PARAMS],
                 remappings=[
-                    ("rgb/image",       "/camera/color/image_raw"),
-                    ("rgb/camera_info", "/camera/color/camera_info"),
-                    ("depth/image",     "/camera/depth/image_rect_raw"),
+                    ("rgb/image",       REALSENSE_RGB_TOPIC),
+                    ("rgb/camera_info", REALSENSE_RGB_INFO),
+                    ("depth/image",     REALSENSE_DEPTH_TOPIC),
                     ("odom",            "/rtabmap/odom"),
-                    # IMU topic published by your ZMQ bridge on port 5563
                     ("imu",             "/imu/data"),
                 ],
             ),
         ],
     )
 
-    return LaunchDescription([fresh_arg, bridge, rtabmap])
+    return LaunchDescription([fresh_arg, bridge, realsense, rtabmap])

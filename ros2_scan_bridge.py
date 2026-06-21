@@ -2,19 +2,18 @@
 """
 ros2_scan_bridge.py
 -------------------
-Receives raw BGR + uint16 depth frames from jetson_combined.py over ZMQ
-and republishes them as ROS 2 topics for RTAB-Map. Reads BNO08x IMU directly
-over I2C (no ZMQ hop) in a background thread.
+Reads BNO08x IMU directly over I2C in a background thread and publishes
+/imu/data, /odom (identity), and static TF for RTAB-Map. Color/depth now
+come straight from the realsense2_camera node (see slam_launch.py) instead
+of being forwarded here — the old ZMQ image-forwarding path was capped at
+~14fps by per-frame Python message construction, so it was dropped in
+favor of the official C++ camera driver.
 
 Publishes:
-  /camera/color/image_raw        sensor_msgs/Image      (BGR8)
-  /camera/color/camera_info      sensor_msgs/CameraInfo
-  /camera/depth/image_rect_raw   sensor_msgs/Image      (16UC1, millimetres)
-  /camera/depth/camera_info      sensor_msgs/CameraInfo
-  /imu/data                      sensor_msgs/Imu        (IMU_HZ, BNO08x)
-  /odom                          nav_msgs/Odometry      (identity + max covariance)
-  /tf                            static: odom->base_link, base_link->camera_link,
-                                          base_link->imu_link
+  /imu/data    sensor_msgs/Imu        (IMU_HZ, BNO08x)
+  /odom        nav_msgs/Odometry      (identity + max covariance)
+  /tf          static: odom->base_link, base_link->camera_link,
+                        base_link->imu_link
 
 RTAB-Map IMU integration (slam_launch.py):
     rgbd_odometry remappings:  ('imu', '/imu/data')
@@ -33,13 +32,10 @@ import sys
 import time
 import threading
 
-import cv2
-import numpy as np
-
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image, CameraInfo, Imu
+    from sensor_msgs.msg import Imu
     from nav_msgs.msg import Odometry
     from geometry_msgs.msg import TransformStamped
     import tf2_ros
@@ -47,42 +43,29 @@ except ImportError:
     sys.exit(
         "ERROR: rclpy not found.\n"
         "Source ROS 2 before running:\n"
-        "  source /opt/ros/jazzy/setup.bash"
+        "  source /opt/ros/humble/setup.bash"
     )
-
-try:
-    import zmq
-except ImportError:
-    sys.exit("ERROR: pyzmq not found — pip3 install pyzmq")
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-JETSON_IP         = "127.0.0.1"
-RGB_BRIDGE_PORT   = 5559
-DEPTH_BRIDGE_PORT = 5560
+# camera_link quaternion relative to base_link — physical mounting rotation
+# of the D415 on the robot body. realsense2_camera publishes its own
+# camera_link -> camera_color_optical_frame transform (REP103 body->optical
+# conversion), so this should NOT also bake in that optical-frame rotation —
+# verify orientation in RViz/Foxglove after wiring up and adjust if rotated.
+CAMERA_QX, CAMERA_QY, CAMERA_QZ, CAMERA_QW = 0.0, 0.0, 0.0, 1.0
 
-# RealSense D415 intrinsics at 640×480 (colour stream)
-FX, FY = 601.023, 601.023
-CX, CY = 320.797, 242.064
-DISTORTION = [0.0, 0.0, 0.0, 0.0, 0.0]
-
-# Publish at half resolution so rgbd_odometry runs faster. Set to 1 to disable.
-DOWNSAMPLE = 2
-
-# camera_link quaternion relative to base_link.
-# RealSense D415, lens forward / USB port down, standard ROS optical convention:
-# -90° around X then -90° around Z → qx=-0.5, qy=0.5, qz=-0.5, qw=0.5
-CAMERA_QX, CAMERA_QY, CAMERA_QZ, CAMERA_QW = -0.5, 0.5, -0.5, 0.5
+ODOM_HZ = 30.0   # /odom publish rate
 
 # ── IMU config ────────────────────────────────────────────────────────────────
 
-IMU_HZ       = 400    # BNO08x report rate — practical max ~400 Hz total over I2C
+IMU_HZ       = 200    # BNO08x report rate — must match interval_us below
 IMU_I2C_ADDR = 0x4B   # default BNO08x address on Yahboom carrier
 
 # ── IMU extrinsic (base_link → imu_link) ─────────────────────────────────────
 # Translation: physical offset of IMU from base_link origin in metres.
-IMU_TF_X, IMU_TF_Y, IMU_TF_Z = 0.0, 0.0, 0.05
+IMU_TF_X, IMU_TF_Y, IMU_TF_Z = 0.05, 0.0, 0.0
 
 # Rotation: corrects for the BNO08x mounting orientation.
 #
@@ -95,7 +78,7 @@ IMU_TF_X, IMU_TF_Y, IMU_TF_Z = 0.0, 0.0, 0.05
 # Quaternion: qx = sin(49.2°) ≈ 0.757, qw = cos(49.2°) ≈ 0.653
 IMU_QX, IMU_QY, IMU_QZ, IMU_QW = 0.757, 0.0, 0.0, 0.653
 
-CONNECT_TIMEOUT = 10.0   # warn if no camera frames within this many seconds
+CONNECT_TIMEOUT = 10.0   # warn if no IMU frames within this many seconds
 
 # ── IMU covariance matrices ───────────────────────────────────────────────────
 # Row-major 3×3, diagonal = variance (stddev²).
@@ -124,63 +107,7 @@ for _cov_i in (0, 7, 14):    _ODOM_COV[_cov_i] = 1.0   # position ~1m stddev
 for _cov_i in (21, 28, 35):  _ODOM_COV[_cov_i] = 1.0   # rotation ~57° stddev
 
 
-# ── ZMQ helpers ───────────────────────────────────────────────────────────────
-
-def make_sub_socket(ctx: zmq.Context, ip: str, port: int,
-                    timeout_ms: int = 50) -> zmq.Socket:
-    sock = ctx.socket(zmq.SUB)
-    sock.setsockopt(zmq.RCVHWM,   10)
-    sock.setsockopt(zmq.CONFLATE, 0)
-    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    sock.connect(f"tcp://{ip}:{port}")
-    sock.setsockopt(zmq.SUBSCRIBE, b"")
-    return sock
-
-
-def recv_frame(sock: zmq.Socket) -> np.ndarray | None:
-    """
-    Receive a shape-prefixed raw frame from ZMQ.
-    Wire format: int32[2] (h,w) then raw pixels (uint8 BGR or uint16 depth).
-    Returns ndarray or None on timeout.
-    """
-    try:
-        data = sock.recv()
-    except zmq.Again:
-        return None
-    h, w    = np.frombuffer(data[:8], dtype=np.int32)
-    payload = data[8:]
-    if len(payload) == h * w * 3:
-        return np.frombuffer(payload, dtype=np.uint8).reshape(h, w, 3)
-    elif len(payload) == h * w * 2:
-        return np.frombuffer(payload, dtype=np.uint16).reshape(h, w)
-    return None
-
-
 # ── ROS 2 message factories ───────────────────────────────────────────────────
-
-def make_camera_info(stamp, frame_id, w, h, fx, fy, cx, cy) -> CameraInfo:
-    ci = CameraInfo()
-    ci.header.stamp    = stamp
-    ci.header.frame_id = frame_id
-    ci.width, ci.height = w, h
-    ci.distortion_model = "plumb_bob"
-    ci.d = DISTORTION
-    ci.k = [fx,  0.0, cx,  0.0, fy,  cy,  0.0, 0.0, 1.0]
-    ci.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-    ci.p = [fx,  0.0, cx,  0.0, 0.0, fy,  cy,  0.0, 0.0, 0.0, 1.0, 0.0]
-    return ci
-
-
-def make_image(stamp, frame_id, arr, encoding, step_mult) -> Image:
-    msg = Image()
-    msg.header.stamp    = stamp
-    msg.header.frame_id = frame_id
-    msg.height, msg.width = arr.shape[:2]
-    msg.encoding = encoding
-    msg.step     = arr.shape[1] * step_mult
-    msg.data     = arr.tobytes()
-    return msg
-
 
 def make_tf(stamp, parent, child,
             tx=0.0, ty=0.0, tz=0.0,
@@ -203,17 +130,17 @@ def make_tf(stamp, parent, child,
 
 class RGBDBridgeNode(Node):
     """
-    Polls ZMQ for BGR + depth frames and republishes to ROS 2.
-    Reads BNO08x directly over I2C in a daemon thread (_imu_loop).
+    Reads BNO08x directly over I2C in a daemon thread (_imu_loop) and
+    publishes /imu/data, /odom, and static TF.
 
     TF tree:
         odom
           └─ base_link
-               ├─ camera_link
+               ├─ camera_link   (realsense2_camera owns frames below this)
                └─ imu_link
     """
 
-    def __init__(self, zmq_ctx: zmq.Context):
+    def __init__(self):
         super().__init__("ros2_scan_bridge")
 
         # ── Static transforms ─────────────────────────────────────────────────
@@ -229,27 +156,16 @@ class RGBDBridgeNode(Node):
         ])
 
         # ── Publishers ────────────────────────────────────────────────────────
-        self.rgb_pub      = self.create_publisher(Image,      "/camera/color/image_raw",     10)
-        self.rgb_info_pub = self.create_publisher(CameraInfo, "/camera/color/camera_info",    10)
-        self.dep_pub      = self.create_publisher(Image,      "/camera/depth/image_rect_raw", 10)
-        self.dep_info_pub = self.create_publisher(CameraInfo, "/camera/depth/camera_info",    10)
-        self.imu_pub      = self.create_publisher(Imu,        "/imu/data",                   10)
-        self.odom_pub     = self.create_publisher(Odometry,   "/odom",                       10)
-        self.tf_broad     = tf2_ros.TransformBroadcaster(self)
+        self.imu_pub  = self.create_publisher(Imu,      "/imu/data", 10)
+        self.odom_pub = self.create_publisher(Odometry, "/odom",     10)
+        self.tf_broad = tf2_ros.TransformBroadcaster(self)
 
-        # ── ZMQ sockets (camera only — no IMU socket) ─────────────────────────
-        self.rgb_sub = make_sub_socket(zmq_ctx, JETSON_IP, RGB_BRIDGE_PORT)
-        self.dep_sub = make_sub_socket(zmq_ctx, JETSON_IP, DEPTH_BRIDGE_PORT)
-
-        # Intrinsics scaled for the published resolution
-        s = 1.0 / max(1, DOWNSAMPLE)
-        self._fx, self._fy = FX * s, FY * s
-        self._cx, self._cy = CX * s, CY * s
-
-        self._frames     = 0
         self._imu_frames = 0
-        self._t_warn     = time.monotonic()
-        self._running    = True
+        self._t_warn      = time.monotonic()
+        self._running     = True
+
+        # ── Odometry timer ────────────────────────────────────────────────────
+        self.create_timer(1.0 / ODOM_HZ, self._publish_odom)
 
         # ── IMU thread ────────────────────────────────────────────────────────
         self._imu_thread = threading.Thread(
@@ -257,9 +173,11 @@ class RGBDBridgeNode(Node):
         )
         self._imu_thread.start()
 
+        # ── Connect-timeout watchdog ──────────────────────────────────────────
+        self.create_timer(1.0, self._check_imu_connected)
+
         self.get_logger().info(
-            f"Bridge ready — rgb:{RGB_BRIDGE_PORT} depth:{DEPTH_BRIDGE_PORT} "
-            f"imu:direct@{IMU_HZ}Hz downsample:{DOWNSAMPLE}x\n"
+            f"Bridge ready — imu:direct@{IMU_HZ}Hz odom:{ODOM_HZ}Hz\n"
             f"IMU TF: pos=({IMU_TF_X}, {IMU_TF_Y}, {IMU_TF_Z}) "
             f"quat=({IMU_QX:.3f}, {IMU_QY:.3f}, {IMU_QZ:.3f}, {IMU_QW:.3f})"
         )
@@ -282,7 +200,7 @@ class RGBDBridgeNode(Node):
             )
             return
 
-        interval_us     = 100_000
+        interval_us     = 10_000
         period          = 1.0 / IMU_HZ
         reconnect_delay = 3.0
 
@@ -319,8 +237,8 @@ class RGBDBridgeNode(Node):
 
         while self._running:
             try:
-                i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
-                bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR, probe=False)
+                i2c = busio.I2C(board.SCL, board.SDA, frequency=200_000)
+                bno = BNO08X_I2C(i2c, address=IMU_I2C_ADDR)
 
                 bno.enable_feature(BNO_REPORT_GYROSCOPE,       interval_us)
                 bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, interval_us)
@@ -331,8 +249,8 @@ class RGBDBridgeNode(Node):
                 count = 0
 
                 while self._running:
-                    gyro = bno.gyro                
-                    quat = bno.quaternion 
+                    gyro = bno.gyro
+                    quat = bno.quaternion
 
                     if gyro is None or quat is None:
                         next_deadline += period
@@ -380,9 +298,9 @@ class RGBDBridgeNode(Node):
 
     # ── Odometry ──────────────────────────────────────────────────────────────
 
-    def _publish_odom(self, stamp) -> None:
+    def _publish_odom(self) -> None:
         odom = Odometry()
-        odom.header.stamp    = stamp
+        odom.header.stamp    = self.get_clock().now().to_msg()
         odom.header.frame_id = "odom"
         odom.child_frame_id  = "base_link"
         odom.pose.pose.orientation.w = 1.0
@@ -390,56 +308,10 @@ class RGBDBridgeNode(Node):
         odom.twist.covariance = list(_ODOM_COV)
         self.odom_pub.publish(odom)
 
-    # ── Camera ────────────────────────────────────────────────────────────────
+    # ── Watchdog ──────────────────────────────────────────────────────────────
 
-    def _publish_cameras(self) -> None:
-        rgb = recv_frame(self.rgb_sub)
-        dep = recv_frame(self.dep_sub)
-
-        stamp = self.get_clock().now().to_msg()
-
-        if rgb is not None:
-            if DOWNSAMPLE > 1:
-                rgb = cv2.resize(rgb, (rgb.shape[1] // DOWNSAMPLE,
-                                       rgb.shape[0] // DOWNSAMPLE))
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            self.rgb_pub.publish(make_image(stamp, "camera_link", rgb, "rgb8", 3))
-            self.rgb_info_pub.publish(make_camera_info(
-                stamp, "camera_link",
-                w=rgb.shape[1], h=rgb.shape[0],
-                fx=self._fx, fy=self._fy, cx=self._cx, cy=self._cy,
-            ))
-            self._frames += 1
-            if self._frames == 1:
-                self.get_logger().info(f"First colour frame: {rgb.shape[1]}×{rgb.shape[0]}")
-
-        if dep is not None:
-            if DOWNSAMPLE > 1:
-                dep = cv2.resize(dep,
-                                 (dep.shape[1] // DOWNSAMPLE,
-                                  dep.shape[0] // DOWNSAMPLE),
-                                 interpolation=cv2.INTER_NEAREST)
-            self.dep_pub.publish(make_image(stamp, "camera_link", dep, "16UC1", 2))
-            self.dep_info_pub.publish(make_camera_info(
-                stamp, "camera_link",
-                w=dep.shape[1], h=dep.shape[0],
-                fx=self._fx, fy=self._fy, cx=self._cx, cy=self._cy,
-            ))
-
-    # ── Main spin ─────────────────────────────────────────────────────────────
-
-    def spin_once(self) -> None:
-        stamp = self.get_clock().now().to_msg()
-        self._publish_odom(stamp)
-        self._publish_cameras()
-
+    def _check_imu_connected(self) -> None:
         now = time.monotonic()
-        if self._frames == 0 and (now - self._t_warn) > CONNECT_TIMEOUT:
-            self.get_logger().warn(
-                f"No camera frames in {CONNECT_TIMEOUT}s — is jetson_combined.py running?"
-            )
-            self._t_warn = now
-
         if self._imu_frames == 0 and (now - self._t_warn) > CONNECT_TIMEOUT:
             self.get_logger().warn(
                 "No IMU frames — check BNO08x wiring and adafruit-circuitpython-bno08x install"
@@ -448,8 +320,6 @@ class RGBDBridgeNode(Node):
 
     def destroy(self) -> None:
         self._running = False
-        self.rgb_sub.close()
-        self.dep_sub.close()
         super().destroy_node()
 
 
@@ -457,22 +327,16 @@ class RGBDBridgeNode(Node):
 
 def main() -> None:
     rclpy.init()
-    ctx  = zmq.Context()
-    node = RGBDBridgeNode(ctx)
+    node = RGBDBridgeNode()
     try:
-        while rclpy.ok():
-            node.spin_once()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.get_logger().info(
-            f"Stopped — {node._frames} colour frames, {node._imu_frames} IMU samples"
-        )
+        node.get_logger().info(f"Stopped — {node._imu_frames} IMU samples")
         node.destroy()
         rclpy.shutdown()
-        ctx.term()
 
 
 if __name__ == "__main__":
     main()
-    
