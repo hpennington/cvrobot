@@ -75,6 +75,13 @@ RTABMAP_PARAMS = {
     # This is the single highest-impact change for fast rotation robustness.
     "Vis/FeatureType":    "2",    # ORB
     "Vis/MaxFeatures":    "3000",
+    # Match the loop-closure keypoint detector to ORB so Mem/UseOdomFeatures
+    # stays enabled (was silently disabled — Kp/DetectorStrategy defaulted to
+    # a different detector than Vis/FeatureType).
+    "Kp/DetectorStrategy": "2",   # ORB
+    # ORB is a binary descriptor; LSH (not the default KDTree) is the correct
+    # nearest-neighbor strategy for binary descriptors in the BoW vocabulary.
+    "Kp/NNStrategy":       "3",   # LSH
     # Slightly more permissive than default (20), but higher than before (10)
     # to avoid accepting frames with too few inliers into the map
     "Vis/MinInliers":     "12",
