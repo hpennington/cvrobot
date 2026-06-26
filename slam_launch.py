@@ -92,13 +92,20 @@ RTABMAP_PARAMS = {
     "Vis/DepthAsMask": "true",   # keep default — reject features without depth
     # "Stereo/OpticalFlow": "true",
     # "Vis/CorType": "1",
-    "approx_sync_max_interval": 0.1,
+    "approx_sync_max_interval": 0.5,
+    # orbbec publishes images as BEST_EFFORT; match it or data won't flow
+    "qos_image":       2,
+    "qos_camera_info": 2,
 }
 
 RGBD_ODOM_PARAMS = {
     "frame_id":    "base_link",
     "approx_sync": True,
     "queue_size":  100,
+    # orbbec publishes all topics as BEST_EFFORT; match or data won't flow
+    "qos":             2,
+    "qos_camera_info": 2,
+    "qos_imu":         2,
 
     # ── Odom-loss recovery ────────────────────────────────────────────────────
     # FIX: was "1" — a single dropped frame during a fast spin immediately
@@ -135,39 +142,38 @@ RGBD_ODOM_PARAMS = {
     "Vis/ImageDecimation": "1",
     # "Stereo/OpticalFlow": "true",
     # "Odom/Strategy": "1",
-    "approx_sync_max_interval": 0.1,
+    "approx_sync_max_interval": 0.5,
 }
 
-# realsense2_camera publishes color/depth directly (replaces the old
-# ros2_scan_bridge ZMQ image forwarding, which was capped at ~14fps by
-# per-frame Python message construction). align_depth makes the depth
-# topic match the color stream's resolution/intrinsics, as rgbd_odometry
-# and rtabmap require.
-#
-# NOTE: confirm these exact topic names with `ros2 topic list` against the
-# installed realsense-ros version before relying on them — naming
-# conventions (e.g. /camera/color/... vs /camera/camera/color/...) have
-# changed across releases.
-REALSENSE_PARAMS = {
-    "camera_name":          "camera",
-    "enable_color":         True,
-    "rgb_camera.profile":   "640x480x30",
-    "enable_depth":         True,
-    "depth_module.profile": "640x480x30",
-    "align_depth.enable":   True,
-    "publish_tf":           True,
-    # "exposure": "5000",
-    # "enable_auto_exposure": False,
-    "approx_sync_max_interval": 0.1,
+# orbbec_camera_node (standalone) ignores camera_name as a topic prefix and
+# publishes at root level: /color/image_raw, /depth/image_raw, /gyro_accel/sample.
+# depth_registration has no effect in this SDK build — no D2C topic is produced,
+# so we consume raw depth and let RTAB-Map use the TF from /tf_static for alignment.
+ORBBEC_PARAMS = {
+    "camera_name":  "camera",
+    "color_width":  640,
+    "color_height": 400,
+    "color_fps":    30,
+    "depth_width":  640,
+    "depth_height": 400,
+    "depth_fps":    30,
+    "enable_color": True,
+    "enable_depth": True,
+    "depth_format": "Y14",
+    "publish_tf":   True,
+    "enable_accel": True,
+    "enable_gyro":  True,
+    "accel_rate":   "100hz",
+    "accel_range":  "4g",
+    "gyro_rate":    "200hz",
+    "gyro_range":   "1000dps",
+    "enable_sync_output_accel_gyro": True,
+    "time_domain":  "system",
 }
 
-# camera_namespace overrides (even explicit "") don't take effect on this
-# realsense-ros version — it nests topics under /camera/camera/... (camera_
-# namespace falls back to camera_name) regardless. Confirmed via
-# `ros2 topic hz` against the node's actual output rather than fighting it.
-REALSENSE_RGB_TOPIC    = "/camera/camera/color/image_raw"
-REALSENSE_RGB_INFO     = "/camera/camera/color/camera_info"
-REALSENSE_DEPTH_TOPIC  = "/camera/camera/aligned_depth_to_color/image_raw"
+ORBBEC_RGB_TOPIC   = "/color/image_raw"
+ORBBEC_RGB_INFO    = "/color/camera_info"
+ORBBEC_DEPTH_TOPIC = "/depth/image_raw"
 
 
 def generate_launch_description():
@@ -182,12 +188,31 @@ def generate_launch_description():
         output="screen",
     )
 
-    realsense = Node(
-        package="realsense2_camera",
-        executable="realsense2_camera_node",
+    orbbec = Node(
+        package="orbbec_camera",
+        executable="orbbec_camera_node",
         name="camera",
         output="screen",
-        parameters=[REALSENSE_PARAMS],
+        parameters=[ORBBEC_PARAMS],
+    )
+
+    # /gyro_accel/sample has raw accel+gyro but no orientation quaternion.
+    # Madgwick integrates accel+gyro → orientation so RTAB-Map can use the IMU.
+    imu_filter = Node(
+        package="imu_filter_madgwick",
+        executable="imu_filter_madgwick_node",
+        name="imu_filter",
+        output="screen",
+        parameters=[{
+            "use_mag":     False,
+            "publish_tf":  False,
+            "world_frame": "enu",
+            "gain":        0.1,
+        }],
+        remappings=[
+            ("imu/data_raw", "/gyro_accel/sample"),
+            ("imu/data",     "/imu/filtered"),
+        ],
     )
 
     rtabmap = TimerAction(
@@ -201,9 +226,9 @@ def generate_launch_description():
                 output="screen",
                 parameters=[RTABMAP_PARAMS],
                 remappings=[
-                    ("rgb/image",       REALSENSE_RGB_TOPIC),
-                    ("rgb/camera_info", REALSENSE_RGB_INFO),
-                    ("depth/image",     REALSENSE_DEPTH_TOPIC),
+                    ("rgb/image",       ORBBEC_RGB_TOPIC),
+                    ("rgb/camera_info", ORBBEC_RGB_INFO),
+                    ("depth/image",     ORBBEC_DEPTH_TOPIC),
                     ("odom",            "/rtabmap/odom"),
                 ],
                 arguments=["--delete_db_on_start"],
@@ -216,14 +241,14 @@ def generate_launch_description():
                 output="screen",
                 parameters=[RGBD_ODOM_PARAMS],
                 remappings=[
-                    ("rgb/image",       REALSENSE_RGB_TOPIC),
-                    ("rgb/camera_info", REALSENSE_RGB_INFO),
-                    ("depth/image",     REALSENSE_DEPTH_TOPIC),
+                    ("rgb/image",       ORBBEC_RGB_TOPIC),
+                    ("rgb/camera_info", ORBBEC_RGB_INFO),
+                    ("depth/image",     ORBBEC_DEPTH_TOPIC),
                     ("odom",            "/rtabmap/odom"),
-                    ("imu",             "/imu/data"),
+                    ("imu",             "/imu/filtered"),
                 ],
             ),
         ],
     )
 
-    return LaunchDescription([fresh_arg, bridge, realsense, rtabmap])
+    return LaunchDescription([fresh_arg, bridge, orbbec, imu_filter, rtabmap])
