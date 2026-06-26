@@ -36,11 +36,8 @@ RTABMAP_PARAMS = {
     "Grid/MaxObstacleHeight":   "0.4",
 
     # ── Planar (2-D) motion constraint ────────────────────────────────────────
-    "Reg/Force3DoF":          "true",
-    "Reg/Strategy": "2",
-    "Icp/PointToPlane":  "true",
-    "Icp/VoxelSize":     "0.05",
-    "Icp/MaxCorrespondenceDistance": "0.1",
+    "Reg/Force3DoF": "true",
+    "Reg/Strategy":  "0",    # Visual only — no lidar/scan available
     # Re-enabled: BNO08x gravity provides yaw-drift anchor during fast rotation.
     # Was "0" (disabled) before — that caused pose graph inconsistency after spins.
     "Optimizer/GravitySigma": "0.3",
