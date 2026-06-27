@@ -175,7 +175,7 @@ ORBBEC_DEPTH_TOPIC = "/depth/image_raw"
 
 def generate_launch_description():
     fresh_arg = DeclareLaunchArgument(
-        "fresh", default_value="true",
+        "fresh", default_value="false",
         description="Delete the RTAB-Map database on start for a clean map",
     )
 
@@ -212,6 +212,23 @@ def generate_launch_description():
         ],
     )
 
+    depth_to_scan = Node(
+        package="depthimage_to_laserscan",
+        executable="depthimage_to_laserscan_node",
+        name="depth_to_scan",
+        output="screen",
+        parameters=[{
+            "range_min":   0.2,
+            "range_max":   4.0,
+            "scan_height": 5,
+        }],
+        remappings=[
+            ("depth",             "/depth/image_raw"),
+            ("depth_camera_info", "/depth/camera_info"),
+            ("scan",              "/scan"),
+        ],
+    )
+
     rtabmap = TimerAction(
         period=2.0,
         actions=[
@@ -227,6 +244,7 @@ def generate_launch_description():
                     ("rgb/camera_info", ORBBEC_RGB_INFO),
                     ("depth/image",     ORBBEC_DEPTH_TOPIC),
                     ("odom",            "/rtabmap/odom"),
+                    ("grid_map",        "/map"),
                 ],
                 arguments=["--delete_db_on_start"],
             ),
@@ -248,4 +266,4 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([fresh_arg, bridge, orbbec, imu_filter, rtabmap])
+    return LaunchDescription([fresh_arg, bridge, orbbec, imu_filter, depth_to_scan, rtabmap])

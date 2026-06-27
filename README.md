@@ -80,4 +80,6 @@ source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cp
 ### My Bluetooth joystick address
 30:31:7D:86:26:1A
 
-
+  ros2 launch nav2_bringup navigation_launch.py \
+    params_file:=$HOME/cvrobot/nav2_params.yaml \
+    use_localization:=false

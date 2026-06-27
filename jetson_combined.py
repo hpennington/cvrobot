@@ -38,6 +38,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image as RosImage
+from geometry_msgs.msg import Twist
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -57,6 +58,7 @@ LEFT_AXIS       = 1
 RIGHT_AXIS      = 3
 SEND_HZ         = 10
 WATCHDOG_HZ     = 4
+CMDVEL_TIMEOUT  = 0.5   # seconds without /cmd_vel before sending a stop packet
 
 WEBCAM_INDEX    = 6
 QUALITY         = 50
@@ -116,7 +118,8 @@ drive_cmd  = {"left": 0.0, "right": 0.0}  # normalised [-1, 1]
 imu_lock = threading.Lock()
 latest_imu = None  # dict: {"accel": (x,y,z), "gyro": (x,y,z), "quat": (i,j,k,w)}
 
-stop_event = threading.Event()
+stop_event    = threading.Event()
+cmdvel_ready  = threading.Event()   # set once serial port is open and bridge is spinning
 
 # ── ZMQ context ───────────────────────────────────────────────────────────────
 
@@ -230,6 +233,139 @@ def normalise(raw: float) -> float:
 
 def build_packet(left: float, right: float) -> bytes:
     return f"L:{left:+.3f},R:{right:+.3f}\n".encode()
+
+# ── Nav2 /cmd_vel → serial thread ────────────────────────────────────────────
+
+class _CmdVelNode(Node):
+    def __init__(self, ser: serial.Serial) -> None:
+        super().__init__("jetson_cmd_vel")
+        self._ser = ser
+        self._last_recv = time.monotonic()
+        self._stopped = False
+        self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
+        self.create_timer(CMDVEL_TIMEOUT / 2, self._watchdog)
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        v, w = msg.linear.x, msg.angular.z
+        left  = max(-1.0, min(1.0, (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS / MAX_WHEEL_SPEED))
+        right = max(-1.0, min(1.0, (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS / MAX_WHEEL_SPEED))
+        self._ser.write(build_packet(left, right))
+        self._last_recv = time.monotonic()
+        self._stopped = False
+        with drive_lock:
+            drive_cmd["left"]  = left
+            drive_cmd["right"] = right
+
+    def _watchdog(self) -> None:
+        if not self._stopped and time.monotonic() - self._last_recv > CMDVEL_TIMEOUT:
+            self._ser.write(build_packet(0.0, 0.0))
+            self._stopped = True
+            with drive_lock:
+                drive_cmd["left"]  = 0.0
+                drive_cmd["right"] = 0.0
+
+
+def cmd_vel_loop() -> None:
+    from rclpy.executors import SingleThreadedExecutor
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print(f"[cmd_vel] {SERIAL_PORT} @ {BAUD_RATE} baud, listening on /cmd_vel")
+    node = _CmdVelNode(ser)
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    cmdvel_ready.set()
+    try:
+        while not stop_event.is_set():
+            executor.spin_once(timeout_sec=0.1)
+    finally:
+        ser.write(build_packet(0.0, 0.0))
+        ser.close()
+        node.destroy_node()
+    print("[cmd_vel] thread exiting")
+
+
+# ── Nav2 point-to-point goal ─────────────────────────────────────────────────
+
+def goto_goal(x: float, y: float, yaw_degrees: float = 0.0, timeout_sec: float = 120.0) -> None:
+    import math
+    from rclpy.action import ActionClient
+    from rclpy.executors import SingleThreadedExecutor
+    from nav2_msgs.action import NavigateToPose
+    from geometry_msgs.msg import PoseStamped
+    from action_msgs.msg import GoalStatus
+
+    node = rclpy.create_node("jetson_goto")
+    client = ActionClient(node, NavigateToPose, "navigate_to_pose")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    print("[goto] waiting for cmd_vel serial bridge...")
+    if not cmdvel_ready.wait(timeout=10.0):
+        print("[goto] serial bridge never became ready — is cmd_vel_loop running?")
+        node.destroy_node()
+        return
+
+    print("[goto] waiting for navigate_to_pose action server...")
+    while not client.wait_for_server(timeout_sec=1.0):
+        if stop_event.is_set():
+            node.destroy_node()
+            return
+        print("[goto] still waiting for Nav2...")
+
+    goal = NavigateToPose.Goal()
+    goal.pose = PoseStamped()
+    goal.pose.header.frame_id = "map"
+    goal.pose.header.stamp = node.get_clock().now().to_msg()
+    goal.pose.pose.position.x = float(x)
+    goal.pose.pose.position.y = float(y)
+    half = math.radians(yaw_degrees) / 2.0
+    goal.pose.pose.orientation.z = math.sin(half)
+    goal.pose.pose.orientation.w = math.cos(half)
+
+    _first_feedback = [True]
+
+    def _feedback(feedback_msg):
+        fb = feedback_msg.feedback
+        if _first_feedback[0]:
+            _first_feedback[0] = False
+            if fb.distance_remaining < 0.1:
+                print("[goto] WARNING: distance_remaining=0 on first feedback — "
+                      "Nav2 may think robot is already at goal. "
+                      "Check: ros2 topic echo /tf --once and confirm map→base_link is correct.")
+        print(f"[goto] {fb.distance_remaining:.2f}m remaining  "
+              f"(recoveries: {fb.number_of_recoveries})", end="\r")
+
+    print(f"[goto] sending goal → ({x:.2f}, {y:.2f}) yaw={yaw_degrees:.0f}°")
+    send_future = client.send_goal_async(goal, feedback_callback=_feedback)
+    executor.spin_until_future_complete(send_future)
+
+    goal_handle = send_future.result()
+    if not goal_handle.accepted:
+        print("[goto] goal rejected by Nav2")
+        node.destroy_node()
+        return
+
+    print("[goto] goal accepted, navigating...")
+    result_future = goal_handle.get_result_async()
+    executor.spin_until_future_complete(result_future, timeout_sec=timeout_sec)
+
+    if not result_future.done():
+        print(f"\n[goto] timed out after {timeout_sec:.0f}s — cancelling")
+        goal_handle.cancel_goal_async()
+        node.destroy_node()
+        return
+
+    status = result_future.result().status
+    if status == GoalStatus.STATUS_SUCCEEDED:
+        print(f"\n[goto] arrived at ({x:.2f}, {y:.2f})")
+    elif status == GoalStatus.STATUS_ABORTED:
+        print(f"\n[goto] aborted — Nav2 could not complete the path")
+    elif status == GoalStatus.STATUS_CANCELED:
+        print(f"\n[goto] cancelled")
+    else:
+        print(f"\n[goto] ended with status {status}")
+    node.destroy_node()
+
 
 # ── Joystick/serial thread ────────────────────────────────────────────────────
 
@@ -908,26 +1044,46 @@ if __name__ == "__main__":
     parser.add_argument("--record",       action="store_true")
     parser.add_argument("--foxglove",     action="store_true",
                         help=f"Start Foxglove WebSocket bridge on port {FOXGLOVE_PORT}")
+    parser.add_argument("--joystick",     action="store_true",
+                        help="Drive with gamepad instead of Nav2 /cmd_vel")
+    parser.add_argument("--goto",         nargs=2, type=float, metavar=("X", "Y"),
+                        help="Drive to (X, Y) in map frame (metres) then exit")
+    parser.add_argument("--yaw",          type=float, default=0.0,
+                        help="Target heading in degrees for --goto (default: 0 = original forward)")
     args = parser.parse_args()
+
+    if args.goto and args.joystick:
+        print("error: --goto and --joystick are mutually exclusive")
+        sys.exit(1)
+
+    rclpy.init()
 
     #threading.Thread(target=capture_webcam,        daemon=True).start()
     # threading.Thread(target=capture_realsense,       daemon=True).start()
     # threading.Thread(target=realsense_jpeg_publisher, daemon=True).start()
-    threading.Thread(target=drive_loop,              daemon=True).start()
+    if args.joystick:
+        threading.Thread(target=drive_loop,   daemon=True).start()
+    else:
+        threading.Thread(target=cmd_vel_loop, daemon=True).start()
     # threading.Thread(target=follower_loop,     daemon=True).start()
     #threading.Thread(target=imu_loop,          daemon=True).start()
 
     if args.foxglove:
         threading.Thread(target=foxglove_bridge, daemon=True).start()
 
-    if args.record:
-        record_loop(args.task, args.num_episodes, args.repo_id)
-    else:
-        print("Running. Ctrl-C to stop.")
-        print("Tip: add --foxglove to stream cameras/drive/arm to Foxglove Studio")
-        try:
+    try:
+        if args.goto:
+            goto_goal(args.goto[0], args.goto[1], args.yaw)
+        elif args.record:
+            record_loop(args.task, args.num_episodes, args.repo_id)
+        else:
+            print("Running. Ctrl-C to stop.")
+            print("Tip: add --foxglove to stream cameras/drive/arm to Foxglove Studio")
             threading.Event().wait()
-        except KeyboardInterrupt:
-            stop_event.set()
-            time.sleep(1)
-            print("Shutdown complete.")
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        stop_event.set()
+        time.sleep(1)
+        rclpy.shutdown()
+        print("Shutdown complete.")

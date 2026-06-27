@@ -2,12 +2,13 @@
 """
 ros2_scan_bridge.py
 -------------------
-Publishes /odom (identity) and static TF so RTAB-Map has a valid tree.
+Publishes a placeholder /odom topic for visualization and a static
+base_link->camera_link transform for the camera mount.
 IMU is now provided directly by the orbbec_camera node (/camera/imu).
 
 Publishes:
   /odom        nav_msgs/Odometry      (identity + max covariance)
-  /tf          static: odom->base_link, base_link->camera_link
+  /tf          static: base_link->camera_link
 
 Run in a sourced ROS 2 terminal (system Python, not conda):
 
@@ -70,13 +71,13 @@ def make_tf(stamp, parent, child,
 
 class RGBDBridgeNode(Node):
     """
-    Publishes /odom and the static TF chain that connects the robot frame
-    to the camera.  IMU comes from orbbec_camera (/camera/imu).
+    Publishes a placeholder /odom message stream and the static transform
+    that connects the robot frame to the camera. IMU comes from
+    orbbec_camera (/camera/imu).
 
     TF tree:
-        odom
-          └─ base_link
-               └─ camera_link   (orbbec_camera owns frames below this)
+        base_link
+          └─ camera_link   (orbbec_camera owns frames below this)
     """
 
     def __init__(self):
@@ -86,7 +87,6 @@ class RGBDBridgeNode(Node):
         static_tf  = tf2_ros.StaticTransformBroadcaster(self)
         init_stamp = self.get_clock().now().to_msg()
         static_tf.sendTransform([
-            make_tf(init_stamp, "odom",      "base_link"),
             make_tf(init_stamp, "base_link", "camera_link",
                     qx=CAMERA_QX, qy=CAMERA_QY, qz=CAMERA_QZ, qw=CAMERA_QW),
         ])
